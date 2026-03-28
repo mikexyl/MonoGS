@@ -170,16 +170,17 @@ class BackEnd(mp.Process):
             or self.gaussians._xyz.grad is None
             or debug_stats is None
             or "regularizer_idx" not in debug_stats
-            or "field_commitment" not in debug_stats
         ):
             return None
 
         damping_idx = debug_stats["regularizer_idx"]
-        field_commitment = debug_stats["field_commitment"]
-        if damping_idx.numel() == 0 or field_commitment.numel() == 0:
+        damping_source = debug_stats.get("solidness")
+        if damping_source is None:
+            damping_source = debug_stats.get("field_commitment")
+        if damping_source is None or damping_idx.numel() == 0 or damping_source.numel() == 0:
             return None
 
-        commitment = field_commitment.detach().view(-1)
+        commitment = damping_source.detach().view(-1)
         threshold = torch.clamp(
             torch.tensor(
                 self.commitment_damping_threshold,
@@ -200,7 +201,7 @@ class BackEnd(mp.Process):
         )
         if commitment.numel() > 1 and damping_quantile.item() < 1.0:
             adaptive_threshold = torch.quantile(commitment, damping_quantile)
-            adaptive_threshold = adaptive_threshold.clamp_(0.1, 1.0 - 1e-6)
+            adaptive_threshold = adaptive_threshold.clamp_(0.01, 1.0 - 1e-6)
             threshold = torch.minimum(threshold, adaptive_threshold)
         anchor_strength = ((commitment - threshold) / (1.0 - threshold)).clamp_(0.0, 1.0)
         if not anchor_strength.any():
@@ -458,6 +459,8 @@ class BackEnd(mp.Process):
             return zero, zero, zero, active_mask, commitment_proposals, 0, None
 
         regularizer_idx = active_idx
+        regularizer_proposals = commitment_proposals
+        regularizer_support = observation_support
         if (
             self.commitment_max_points > 0
             and active_idx.numel() > self.commitment_max_points
@@ -466,6 +469,9 @@ class BackEnd(mp.Process):
                 : self.commitment_max_points
             ]
             regularizer_idx = active_idx[sample_idx]
+            regularizer_proposals = commitment_proposals[sample_idx]
+            if observation_support is not None:
+                regularizer_support = observation_support[sample_idx]
 
         regularizer_count = int(regularizer_idx.numel())
         if regularizer_count <= 1:
@@ -503,11 +509,29 @@ class BackEnd(mp.Process):
         sampled_grad = photo_xyz_grad[regularizer_idx]
         xyz_lr = max(self._get_xyz_lr(), 1e-6)
         photo_delta = (-xyz_lr * sampled_grad).detach()
-        neighbor_commitment = field_commitment_detached[neighbor_idx].squeeze(-1)
+
+        scaling = self.gaussians.get_scaling[regularizer_idx]
+        if scaling.shape[-1] == 1:
+            scaling = scaling.repeat(1, 3)
+        anchor_scale = local_scale.sqrt().detach().clamp_min(1e-3)
+        anchor_residual = (xyz - anchor_xyz.detach()) / anchor_scale
+        stability = regularizer_proposals.detach().view(-1, 1).clamp_(0.0, 1.0)
+        if regularizer_support is None:
+            support = torch.ones_like(stability)
+        else:
+            support = regularizer_support.detach().view(-1, 1).clamp_(0.0, 1.0)
+        settledness = torch.exp(-anchor_residual.detach().norm(dim=1, keepdim=True))
+        trust = (stability * support * settledness).clamp_(0.0, 1.0)
+        trust = trust.pow(1.0 / 3.0)
+        solidness = (
+            field_commitment_detached * trust
+        ).clamp_(0.0, 1.0)
+
+        neighbor_solidness = solidness[neighbor_idx].squeeze(-1)
         neighbor_delta = photo_delta[neighbor_idx]
-        self_commitment = field_commitment_detached.squeeze(-1)
-        consensus_weights = kernel * neighbor_commitment
-        weights = torch.cat((self_commitment.unsqueeze(1), consensus_weights), dim=1)
+        self_solidness = solidness.squeeze(-1)
+        consensus_weights = kernel * neighbor_solidness
+        weights = torch.cat((self_solidness.unsqueeze(1), consensus_weights), dim=1)
         delta_bank = torch.cat((photo_delta.unsqueeze(1), neighbor_delta), dim=1)
         raw_denom = weights.sum(dim=1, keepdim=True)
         denom = raw_denom.clamp_min(1e-6)
@@ -518,27 +542,21 @@ class BackEnd(mp.Process):
         if fallback.any():
             consensus_delta[fallback] = photo_delta[fallback]
 
-        effective_delta = (1.0 - field_commitment_detached) * photo_delta + (
-            field_commitment_detached * consensus_delta.detach()
+        effective_delta = (1.0 - solidness) * photo_delta + (
+            solidness * consensus_delta.detach()
         )
         coherence_target = xyz.detach() + effective_delta
         coherence_residual = xyz - coherence_target
         loss_coh = (
-            field_commitment_detached
-            * coherence_residual.pow(2).sum(dim=1, keepdim=True)
+            solidness * coherence_residual.pow(2).sum(dim=1, keepdim=True)
         ).mean() / xyz_lr
 
-        scaling = self.gaussians.get_scaling[regularizer_idx]
-        if scaling.shape[-1] == 1:
-            scaling = scaling.repeat(1, 3)
-        anchor_scale = local_scale.sqrt().detach().clamp_min(1e-3)
-        anchor_residual = (xyz - anchor_xyz.detach()) / anchor_scale
-        anchor_weight = field_commitment_detached.pow(2)
+        anchor_weight = solidness.pow(2)
         loss_anchor = (
             anchor_weight * anchor_residual.pow(2).sum(dim=1, keepdim=True)
         ).mean()
 
-        commitment_delta = neighbor_commitment - self_commitment.unsqueeze(1)
+        commitment_delta = neighbor_solidness - self_solidness.unsqueeze(1)
         gradient_field = (
             kernel.unsqueeze(-1)
             * commitment_delta.unsqueeze(-1)
@@ -568,7 +586,7 @@ class BackEnd(mp.Process):
         photo_grad_proxy_mean = (photo_step_mean / xyz_lr).detach()
         coh_grad_proxy_mean = (
             (
-                field_commitment_detached.squeeze(-1) * coherence_residual.norm(dim=1)
+                solidness.squeeze(-1) * coherence_residual.norm(dim=1)
             ).mean()
             / xyz_lr
         ).detach()
@@ -582,6 +600,11 @@ class BackEnd(mp.Process):
         ).detach()
         field_std = (
             field_commitment_detached.squeeze(-1).std(unbiased=False).detach()
+            if regularizer_count > 1
+            else zero
+        )
+        solid_std = (
+            solidness.squeeze(-1).std(unbiased=False).detach()
             if regularizer_count > 1
             else zero
         )
@@ -603,11 +626,19 @@ class BackEnd(mp.Process):
             ).detach(),
             "anchor_disp_mean": anchor_disp_mean,
             "interface_mean": interface_weight.mean().detach(),
+            "stability_mean": stability.mean().detach(),
+            "support_mean": support.mean().detach(),
+            "settled_mean": settledness.mean().detach(),
+            "trust_mean": trust.mean().detach(),
             "field_mean": field_commitment_detached.mean().detach(),
             "field_std": field_std,
             "field_max": field_commitment_detached.max().detach(),
+            "solid_mean": solidness.mean().detach(),
+            "solid_std": solid_std,
+            "solid_max": solidness.max().detach(),
             "regularizer_idx": regularizer_idx.detach(),
             "field_commitment": field_commitment_detached.squeeze(-1),
+            "solidness": solidness.squeeze(-1),
         }
 
         return (
@@ -720,6 +751,18 @@ class BackEnd(mp.Process):
                         f"field_mean={debug_stats['field_mean'].item():.4f}",
                         f"field_std={debug_stats['field_std'].item():.4f}",
                         f"field_max={debug_stats['field_max'].item():.4f}",
+                    ]
+                )
+            if "solid_mean" in debug_stats:
+                scale_tokens.extend(
+                    [
+                        f"stability_mean={debug_stats['stability_mean'].item():.4f}",
+                        f"support_mean={debug_stats['support_mean'].item():.4f}",
+                        f"settled_mean={debug_stats['settled_mean'].item():.4f}",
+                        f"trust_mean={debug_stats['trust_mean'].item():.4f}",
+                        f"solid_mean={debug_stats['solid_mean'].item():.4f}",
+                        f"solid_std={debug_stats['solid_std'].item():.4f}",
+                        f"solid_max={debug_stats['solid_max'].item():.4f}",
                     ]
                 )
             if "damping_mean" in debug_stats:

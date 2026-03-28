@@ -221,6 +221,73 @@ Interpretation:
 - the direct stabilizer is finally active during live mapping instead of being a dormant code path,
 - this does not yet prove that the table-crossing divergence is solved visually, but it does remove an important implementation gap: the method now actually exerts optimizer-side resistance where the field says the map should be solid.
 
+Update: 2026-03-28 (settled-solidness diagnosis and geometric-mean trust fix)
+
+The next round of user feedback was more discriminating: the new field-driven anchor version still looked worse, and the user asked whether the system might be solidifying too much during initialization.
+
+The logs answered that question clearly for the current build:
+
+- structural commitment was completely inactive throughout MonoGS warmup,
+- after `Initialized SLAM`, the system still stayed in the explicit `delay` phase for `100` post-init iterations,
+- the first ramp activation happened only after that delay, with tiny commitment values,
+- so initialization over-solidification is **not** the current failure mode.
+
+Instead, the first "settled-solidness" implementation was too strict in a different way. The operative solidness was defined as a full product of:
+
+- the field-smoothed commitment,
+- the current sparse stable-tail proposal,
+- observation support,
+- anchor settledness.
+
+That made the new gate mathematically clean but practically too suppressive. In the headless FR1 Desk smoke run:
+
+- raw field values became significant in live mode, for example around `iter=1390` the field reached roughly `field_mean=0.0681` and `field_max=0.4073`,
+- but the operative solid subset collapsed to roughly `solid_mean=0.0013` and `solid_max=0.1465`,
+- damping therefore stayed weak or sparse even late in live mode,
+- protected-anchor counts also stayed at or near zero, showing that the anchor subset was not really consolidating.
+
+That diagnosis motivated a second formulation change:
+
+- keep the same three trust factors,
+- but combine them with a **geometric mean** instead of a full product,
+- then multiply that softer trust score by the field commitment to obtain operative solidness.
+
+The new definition is:
+
+- field commitment still determines where structural material exists,
+- stability, support, and settledness now modulate that field without annihilating it whenever one factor is merely modest rather than near one.
+
+Validated outcome from the updated headless smoke:
+
+- around `iter=1390` in live mode:
+  - `field_mean=0.0814`
+  - `field_max=0.5478`
+  - `trust_mean=0.0537`
+  - `solid_mean=0.0122`
+  - `solid_max=0.3495`
+  - `damping_threshold=0.0325`
+  - `damped=205`
+- around `iter=1410`:
+  - `field_max=0.5083`
+  - `solid_max=0.4205`
+  - `damping_max=0.1289`
+  - `damped=179`
+  - `protected=5`
+- around `iter=1450`:
+  - `field_mean=0.0767`
+  - `solid_mean=0.0101`
+  - `solid_max=0.3632`
+  - `damping_threshold=0.0290`
+  - `damped=205`
+  - `protected=9`
+
+Interpretation:
+
+- the operative solid subset no longer collapses toward zero while the field itself is strong,
+- the damping path is once again meaningfully active on the sampled structural subset,
+- the current build is now much closer to the intended "field exists, trust gates how rigid it becomes" behavior,
+- but the next question is visual rather than purely scalar: whether this restored solid subset actually helps the far-side table traversal, or whether it has again become too rigid later in the sequence.
+
 ## Implemented Components
 
 ### 1. Persistent Gaussian state

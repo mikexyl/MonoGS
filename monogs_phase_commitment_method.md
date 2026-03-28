@@ -245,18 +245,51 @@ In the implementation, \(\tilde{s}_i\) is what drives:
 
 This makes neighboring anchor candidates reinforce each other instead of hardening independently.
 
+### Settled solidness
+
+The viewer feedback exposed an important failure mode of using the smoothed field \(\tilde{s}_i\) too directly: a region can look historically committed without yet being trustworthy enough to resist motion. That was especially visible when the trajectory moved around the other side of the table; the map could become locally rigid before the anchor identities had really settled.
+
+So the current MonoGS formulation distinguishes between:
+
+- a **commitment field** \(\tilde{s}_i\), which says where anchor-like material exists,
+- an **operative solidness** \(\sigma_i\), which says where that field is currently trustworthy enough to behave rigidly.
+
+In the current implementation,
+\[
+\sigma_i = \tilde{s}_i \cdot
+\left(
+q_i \, o_i \, \exp\!\left(-\left\|\frac{\mu_i-a_i}{\rho_i+\varepsilon}\right\|\right)
+\right)^{1/3},
+\]
+where:
+
+- \(q_i\) is the current stable-tail proposal from the relative photometric ranking,
+- \(o_i\) is the recent observation-support factor,
+- the exponential term suppresses solidness for Gaussians that are still far from their anchor-rest position relative to local neighborhood scale.
+
+Interpretation:
+
+- \(\tilde{s}_i\) is a long-horizon memory of where structure has been consolidating,
+- \(q_i\) asks whether that region is also photometrically quiet **right now**,
+- \(o_i\) asks whether it is repeatedly supported rather than just temporarily easy,
+- the anchor-residual term asks whether the local field is actually settled rather than still in flight.
+
+The geometric mean is important in practice. A full product of all three trust factors turned out to collapse operative solidness too aggressively once the stable-tail proposal became sparse. The geometric mean still requires all three ingredients, but it weakens them multiplicatively rather than annihilating the solid subset.
+
+This keeps the two-type idea intact, but it changes the operational rule from "historically committed regions resist motion" to the stricter rule "historically committed regions resist motion in proportion to how stable, supported, and settled they currently are."
+
 ### Direct optimizer damping
 
-The loss terms above still allow the photometric update to move the solid subset too freely in difficult view transitions. So the current MonoGS implementation also damps the xyz gradient directly for the upper tail of the field-solidness estimate:
+The loss terms above still allow the photometric update to move the solid subset too freely in difficult view transitions. So the current MonoGS implementation also damps the xyz gradient directly for the upper tail of the operative solidness estimate:
 \[
 g_i^{xyz} \leftarrow (1-d_i)\, g_i^{xyz},
 \]
 with
 \[
-d_i = \gamma^{(t)} \lambda_{\text{damp}} \psi(\tilde{s}_i).
+d_i = \gamma^{(t)} \lambda_{\text{damp}} \psi(\sigma_i).
 \]
 
-Here \(\gamma^{(t)}\) is the post-init structural ramp and \(\psi\) is activated only above a field-relative threshold. In practice, the threshold is taken from the upper quantile of the current field, clipped by a configured ceiling, so damping tracks the solid subset even when field magnitudes differ across scenes.
+Here \(\gamma^{(t)}\) is the post-init structural ramp and \(\psi\) is activated only above a field-relative threshold. In practice, the threshold is taken from the upper quantile of the current operative-solidness distribution, clipped by a configured ceiling, so damping tracks the actually settled anchor subset even when raw field magnitudes differ across scenes.
 
 This is the first part of the implementation that directly modulates the optimizer step rather than only adding an auxiliary loss, and it is meant specifically to resist slow map drift when the camera goes around the far side of the table.
 
@@ -313,7 +346,7 @@ Roles of each term:
 - \(\mathcal{L}_{\text{anchor}}\): long-horizon stabilization of committed anchors against drift,
 - \(\mathcal{L}_{\text{thin}}\): interface-localized surface shaping.
 
-After differentiating this objective, the current implementation also applies field-relative xyz-gradient damping to the solid upper tail before the optimizer step. The key simplification is that structural commitment itself is still updated from **relative photometric stability**, but only the stable tail is allowed to harden into anchors. This keeps the method close to the two-type Gaussian idea without introducing a hard discrete label.
+After differentiating this objective, the current implementation also applies field-relative xyz-gradient damping to the solid upper tail before the optimizer step. The key simplification is that structural commitment itself is still updated from **relative photometric stability**, but only the stable tail is allowed to harden into anchors. The optimizer-facing rigidity, however, is now based on the stricter settled-solidness score \(\sigma_i\) rather than on stored commitment alone. This keeps the method close to the two-type Gaussian idea without introducing a hard discrete label.
 
 ---
 
@@ -328,14 +361,14 @@ For each local mapping iteration:
    Compute raw mean updates \(\Delta \mu_i^{\text{photo}}\) and mean-gradient magnitudes \(g_i\).
 
 3. **Build commitment-aware fields**  
-   Using current persistent \(s_i\), build a local field-solidness estimate \(\tilde{s}_i\), then use it to construct \(\mathcal{S}(x)\), \(U(x)\), and \(\nabla \mathcal{S}(\mu_i)\).
+   Using current persistent \(s_i\), build a local field-solidness estimate \(\tilde{s}_i\), then combine it with current stability, observation support, and anchor settledness to obtain the operative solidness \(\sigma_i\). Use that operative field to construct the local consensus behavior and commitment interface.
 
 4. **Commitment-modulated Gaussian optimization**  
    Optimize the Gaussian parameters under
    \[
    \mathcal{L}_{\text{photo}} + \gamma^{(t)} \left(\lambda_{\text{coh}} \mathcal{L}_{\text{coh}} + \lambda_{\text{anchor}} \mathcal{L}_{\text{anchor}} + \lambda_{\text{thin}} \mathcal{L}_{\text{thin}}\right).
    \]
-   Then damp the xyz gradient of the solid upper tail according to the current field estimate before the optimizer step.
+   Then damp the xyz gradient of the solid upper tail according to the current operative-solidness estimate before the optimizer step.
    In the current implementation, this is how the idealized commitment-modulated motion is realized in practice.
 
 5. **Detached commitment update**  
