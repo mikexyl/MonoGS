@@ -46,13 +46,14 @@ Training:
   commitment_init_value: 0.0
   commitment_alpha: 0.05
   commitment_knn: 8
+  commitment_stable_quantile: 0.75
   commitment_chunk_size: 256
   commitment_max_points: 2048
   commitment_log_every: 50
   lambda_coh: 0.5
   lambda_thin: 0.01
   commitment_prune_bias: 0.05
-  commitment_protect_threshold: 0.7
+  commitment_protect_threshold: 0.85
 
   lr:
     cam_rot_delta: 0.003

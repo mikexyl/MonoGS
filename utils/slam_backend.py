@@ -64,13 +64,16 @@ class BackEnd(mp.Process):
         )
         self.commitment_alpha = self.config["Training"].get("commitment_alpha", 0.05)
         self.commitment_knn = self.config["Training"].get("commitment_knn", 8)
+        self.commitment_stable_quantile = self.config["Training"].get(
+            "commitment_stable_quantile", 0.75
+        )
         self.lambda_coh = self.config["Training"].get("lambda_coh", 0.0)
         self.lambda_thin = self.config["Training"].get("lambda_thin", 0.0)
         self.commitment_prune_bias = self.config["Training"].get(
             "commitment_prune_bias", 0.0
         )
         self.commitment_protect_threshold = self.config["Training"].get(
-            "commitment_protect_threshold", 0.7
+            "commitment_protect_threshold", 0.85
         )
         self.commitment_chunk_size = self.config["Training"].get(
             "commitment_chunk_size", 256
@@ -160,7 +163,19 @@ class BackEnd(mp.Process):
             device=grad_norm.device,
             dtype=grad_norm.dtype,
         )
-        return 1.0 - ranks
+        proposals = 1.0 - ranks
+        stable_quantile = torch.clamp(
+            torch.tensor(
+                self.commitment_stable_quantile,
+                device=grad_norm.device,
+                dtype=grad_norm.dtype,
+            ),
+            0.0,
+            1.0 - 1e-6,
+        )
+        # Only the stable tail accumulates commitment; the rest decay toward zero.
+        proposals = (proposals - stable_quantile) / (1.0 - stable_quantile)
+        return proposals.clamp_(0.0, 1.0)
 
     def _compute_structural_commitment_terms(self, photo_xyz_grad, visibility_filters):
         zero = self.gaussians.get_xyz.new_tensor(0.0)
@@ -281,7 +296,10 @@ class BackEnd(mp.Process):
         photo_step_mean = photo_delta.norm(dim=1).mean().detach()
         photo_grad_proxy_mean = (photo_step_mean / xyz_lr).detach()
         coh_grad_proxy_mean = (
-            coherence_residual.norm(dim=1).mean() / xyz_lr
+            (
+                commitment_detached.squeeze(-1) * coherence_residual.norm(dim=1)
+            ).mean()
+            / xyz_lr
         ).detach()
         debug_stats = {
             "photo_step_mean": photo_step_mean,

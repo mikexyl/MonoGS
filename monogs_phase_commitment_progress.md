@@ -62,6 +62,29 @@ Validated outcome:
 - the earlier "6x baseline GPU memory" impression was traced to overlapping stale structural runs on the same GPU rather than a single active structural process pair,
 - with only the current structural run active, total GPU memory sampled at about `1918 MiB`, which is still above the clean baseline sample but no longer pathological.
 
+Update: 2026-03-28 (two-type anchor revision)
+
+The first GUI run after the coherence retune still diverged visually. The logs pointed to a more specific issue:
+
+- the raw percentile proposal always had `proposal_mean=0.5000` by construction,
+- global commitment therefore drifted toward the middle of the range,
+- the number of protected Gaussians climbed into the thousands, which was far too broad for a map that is supposed to have a relatively small structural-anchor subset.
+
+That behavior was too soft and too democratic for the intended two-type Gaussian idea. The formulation was therefore revised in both code and design notes:
+
+- commitment proposals are now sparse and only assigned to the stable tail of active Gaussians (`commitment_stable_quantile = 0.75` by default),
+- Gaussians outside that stable tail decay back toward the exploratory regime rather than drifting toward `0.5`,
+- the structural protection threshold was raised from `0.7` to `0.85`,
+- the live `coh_ratio` diagnostic was corrected to include commitment weighting, because the old proxy became misleading once commitment turned sparse.
+
+Validated outcome:
+
+- the updated structural smoke run completed cleanly in about `100.68s` at about `5.88 FPS`,
+- `proposal_mean` dropped from `0.5000` to about `0.1250`,
+- global commitment mean stayed in the rough `0.08` to `0.15` range instead of drifting toward `0.5`,
+- protected-Gaussian counts stayed in the low hundreds rather than the low thousands,
+- the corrected commitment-weighted `coh_ratio` in early live mapping is now around `1e-3` to `1e-2`, which matches the intentionally sparse anchor set.
+
 ## Implemented Components
 
 ### 1. Persistent Gaussian state
@@ -172,6 +195,7 @@ Shared base and live configs now expose:
 - `commitment_init_value`
 - `commitment_alpha`
 - `commitment_knn`
+- `commitment_stable_quantile`
 - `commitment_chunk_size`
 - `commitment_max_points`
 - `commitment_log_every`
@@ -184,7 +208,9 @@ Current default posture:
 
 - the feature is off by default,
 - the added values are conservative placeholders for opt-in experiments,
-- the shared opt-in default for `lambda_coh` is now `0.5` after live diagnostics showed that `0.1` left coherence too weak to matter.
+- the shared opt-in default for `lambda_coh` is now `0.5` after live diagnostics showed that `0.1` left coherence too weak to matter,
+- the shared opt-in default for `commitment_stable_quantile` is now `0.75`,
+- the shared opt-in default for `commitment_protect_threshold` is now `0.85` so only a smaller anchor subset affects lifecycle decisions.
 
 Example opt-in config:
 
@@ -211,6 +237,9 @@ Runtime observations from the smoke tests:
 - the live diagnostics now report `coh_ratio` mostly in the `0.4` to `0.7` range, confirming that coherence is now material relative to the photometric xyz signal during live mapping,
 - the structural diagnostics only begin after `Initialized SLAM`, confirming that the structural path is bypassed during warmup rather than merely tagged as a separate lifecycle state,
 - the corrected clean-GPU reading for a single active structural smoke run was about `1918 MiB` total device memory at sample time, which is higher than baseline but far below the earlier contaminated multi-run readings.
+- after the sparse-anchor revision, the structural smoke run completed cleanly in about `100.68s` total time at about `5.88 FPS`,
+- after that revision, `proposal_mean` was about `0.1250`, commitment mean stayed near `0.1`, and protected-Gaussian counts stayed in the low hundreds instead of the low thousands,
+- the corrected commitment-weighted `coh_ratio` now reports about `1e-3` to `1e-2` in early live mapping, which matches the intended anchor-sparse regime far better than the old unweighted proxy.
 
 The runtime observability now exposes:
 
@@ -231,14 +260,14 @@ The runtime observability now exposes:
 
 1. The current kNN field is local and active-set-only, not a full-map continuous splat field.
 2. Coherence is realized as a target-position regularizer, not explicit optimizer-step blending.
-3. The coherence term is now material in live mapping (`coh_ratio` is typically around `0.4` to `0.7` in the smoke run), but that has only been validated on the short FR1 Desk smoke sequence.
-4. Commitment values still climb quickly and protected-Gaussian counts still reach the low-thousands in live mapping, so the EMA rate, protection threshold, and proposal definition may still need refinement on longer runs.
+3. The coherence term is no longer large once commitment is made sparse; the next question is whether it is now too weak to improve geometry on longer runs.
+4. The anchor subset is now much smaller, but some Gaussians still saturate near commitment `1.0`, so longer-run validation is still needed to see whether anchor identities remain sensible over time.
 5. The structural path now appears to cost roughly baseline-plus-some-headroom rather than baseline-times-six, but it is still measurably above baseline and should be profiled again on longer sequences.
 6. The existing isotropic scaling prior is still active alongside the thinness prior; their interaction should be evaluated experimentally.
 
 ## Recommended Next Experiment
 
 1. Use the capped structural smoke config as the new safe starting point.
-2. Run the full FR1 Desk structural config and compare convergence against the baseline now that the short smoke run is stable.
-3. Re-evaluate commitment protection thresholds, because protected-Gaussian counts still grow quickly once live mapping starts.
+2. Run the GUI configuration again with the sparse-anchor formulation and check whether the earlier visible divergence is reduced.
+3. Run the full FR1 Desk structural config and compare convergence against the baseline now that the short smoke run is stable.
 4. Profile structural memory again on a longer run to verify that the clean smoke-test memory picture holds outside the short validation sequence.
