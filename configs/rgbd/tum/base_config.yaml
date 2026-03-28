@@ -53,6 +53,10 @@ Training:
   commitment_chunk_size: 256
   commitment_max_points: 2048
   commitment_log_every: 50
+  commitment_start_after_init_iters: 100
+  commitment_ramp_iters: 200
+  map_timing_log_every: 0
+  map_slow_iteration_ms: 250.0
   lambda_coh: 0.5
   lambda_thin: 0.01
   commitment_prune_bias: 0.05

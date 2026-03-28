@@ -10,4 +10,6 @@ Training:
   init_itr_num: 100
   tracking_itr_num: 20
   mapping_itr_num: 20
+  map_timing_log_every: 10
+  map_slow_iteration_ms: 150.0
   use_structural_commitment: False

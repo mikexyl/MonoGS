@@ -104,7 +104,28 @@ This has three advantages:
 - lets commitment be **earned over time** rather than decided from a single iteration,
 - prevents the whole active set from drifting toward middling commitment.
 
-### 3.3 Separate state update
+### 3.3 Post-initialization activation schedule
+
+MonoGS has a fragile transition between map initialization and normal SLAM operation. In practice, the first full-window initialization bundle-adjustment and the first post-init prune can both cause large transient map changes. Turning structural commitment on immediately at that boundary encourages the method to harden premature anchor identities.
+
+So in the practical MonoGS implementation, structural commitment is not activated immediately when MonoGS first reports `Initialized SLAM`. Instead, let \(t_{\mathrm{init}}\) denote that iteration, let \(\Delta_{\mathrm{delay}}\) be a fixed delay, and let \(\Delta_{\mathrm{ramp}}\) be a ramp length. Define a structural activation scale
+\[
+\gamma^{(t)} =
+\begin{cases}
+0, & t - t_{\mathrm{init}} < \Delta_{\mathrm{delay}}, \\
+\operatorname{clip}\left(\frac{t - t_{\mathrm{init}} - \Delta_{\mathrm{delay}} + 1}{\Delta_{\mathrm{ramp}}}, 0, 1\right), & \text{otherwise.}
+\end{cases}
+\]
+
+Interpretation:
+
+- during the delay period, the map is allowed to settle with no structural influence,
+- during the ramp period, commitment EMA updates and structural losses are introduced gradually,
+- pruning protection for high-commitment anchors is only enabled after the ramp reaches full strength.
+
+This keeps the two-type idea intact while avoiding a known failure mode where unstable post-init geometry is hardened too early.
+
+### 3.4 Separate state update
 
 Importantly, \(s_i\) is **not** optimized jointly with the Gaussian parameters by gradient descent. Instead, it is updated **after** the Gaussian optimization step as a detached state update.
 
@@ -139,7 +160,7 @@ Committed regions are therefore encouraged to move like a patch rather than as i
 
 ## 5. Commitment-Modulated Gaussian Motion
 
-For each Gaussian, we replace the raw mean update with a commitment-modulated update:
+In the idealized formulation, each Gaussian would follow a commitment-modulated mean update:
 \[
 \Delta \mu_i^{\text{eff}} = (1-s_i) \, \Delta \mu_i^{\text{photo}} + s_i \, U(\mu_i).
 \]
@@ -154,6 +175,15 @@ This is especially natural in SLAM:
 - newly inserted Gaussians should stay mobile,
 - repeatedly re-observed Gaussians should become stable map support,
 - inconsistent Gaussians should remain flexible or be pruned.
+
+In the current MonoGS implementation, this is used as an **interpretive target**, not as a literal overwrite of Adam's xyz step. The implementation realizes the effect through:
+
+- a coherence loss that encourages committed Gaussians to align with local consensus motion,
+- a thinness prior localized by the commitment interface,
+- commitment-aware pruning bias and anchor protection,
+- the post-initialization delay/ramp schedule above.
+
+That choice keeps the optimizer plumbing simpler and was empirically safer in the existing MonoGS codepath.
 
 ### Coherence regularization
 
@@ -233,14 +263,11 @@ For each local mapping iteration:
    Using current \(s_i\), build \(\mathcal{S}(x)\), \(U(x)\), and \(\nabla \mathcal{S}(\mu_i)\).
 
 4. **Commitment-modulated Gaussian optimization**  
-   Replace raw mean motion by
+   Optimize the Gaussian parameters under
    \[
-   \Delta \mu_i^{\text{eff}} = (1-s_i)\Delta \mu_i^{\text{photo}} + s_i U(\mu_i),
+   \mathcal{L}_{\text{photo}} + \gamma^{(t)} \left(\lambda_{\text{coh}} \mathcal{L}_{\text{coh}} + \lambda_{\text{thin}} \mathcal{L}_{\text{thin}}\right).
    \]
-   and optimize the Gaussian parameters under
-   \[
-   \mathcal{L}_{\text{photo}} + \lambda_{\text{coh}} \mathcal{L}_{\text{coh}} + \lambda_{\text{thin}} \mathcal{L}_{\text{thin}}.
-   \]
+   In the current implementation, this is how the idealized commitment-modulated motion is realized in practice.
 
 5. **Detached commitment update**  
    Recompute or reuse the latest \(g_i\), convert them to stable-tail proposals
@@ -249,13 +276,14 @@ For each local mapping iteration:
    \]
    and update
    \[
-   s_i \leftarrow (1-\alpha)s_i + \alpha q_i.
+   s_i \leftarrow (1-\alpha\gamma^{(t)})s_i + \alpha\gamma^{(t)} q_i.
    \]
+   During the initial delay period, this reduces to no commitment update at all.
 
 6. **Map management**  
    Use \(s_i\) as a map-lifecycle signal:
    - low-\(s_i\) Gaussians remain exploratory and can be pruned or replaced more aggressively,
-   - high-\(s_i\) Gaussians form the structural-anchor subset and are protected more conservatively,
+   - high-\(s_i\) Gaussians form the structural-anchor subset and are protected more conservatively once the structural ramp is fully active,
    - newly spawned Gaussians start with low \(s_i\).
 
 ---

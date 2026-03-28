@@ -1,4 +1,4 @@
-inherit_from: "configs/mono/tum/fr1_desk_structural_commitment.yaml"
+inherit_from: "configs/stereo/euroc/mh02.yaml"
 
 Results:
   use_gui: False
@@ -10,6 +10,6 @@ Training:
   init_itr_num: 100
   tracking_itr_num: 20
   mapping_itr_num: 20
-  commitment_log_every: 10
   map_timing_log_every: 10
   map_slow_iteration_ms: 150.0
+  use_structural_commitment: False

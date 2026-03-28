@@ -85,6 +85,59 @@ Validated outcome:
 - protected-Gaussian counts stayed in the low hundreds rather than the low thousands,
 - the corrected commitment-weighted `coh_ratio` in early live mapping is now around `1e-3` to `1e-2`, which matches the intentionally sparse anchor set.
 
+Update: 2026-03-28 (timing diagnosis, delayed ramp, EuRoC prep)
+
+The next user-visible problem report was more specific: there was a noticeably slow iteration around the early `~10%` part of the run, and the map then appeared to start drifting afterward.
+
+That required separating three different possibilities:
+
+- a structural-regularizer cost spike,
+- a standard MonoGS densify/prune or initialization event,
+- structural commitment activating too early after initialization.
+
+The following continuation work was completed:
+
+- EuRoC experiment scaffolding was added with
+  - `configs/stereo/euroc/mh02_structural_commitment.yaml`
+  - `configs/stereo/euroc/mh02_baseline_smoke.yaml`
+  - `configs/stereo/euroc/mh02_structural_commitment_smoke.yaml`
+- an EuRoC cross-scene run was attempted, but the official ETH dataset host stalled from this machine on both `http` and `https`, so the EuRoC comparison is prepared but still blocked on data access,
+- the backend map loop was instrumented to log:
+  - structural phase transitions,
+  - per-iteration timing breakdown (`render_ms`, `struct_ms`, `densify_ms`, `opacity_ms`, `optim_ms`, `iter_ms`),
+  - lifecycle events (`densify`, `prune`, `opacity_reset`),
+  - point-count changes across those events,
+- the structural formulation was revised again so commitment no longer activates immediately after `Initialized SLAM`:
+  - `commitment_start_after_init_iters = 100`
+  - `commitment_ramp_iters = 200`
+  - structural losses and detached EMA updates are scaled by the ramp,
+  - commitment-aware prune bias is scaled by the same ramp,
+  - high-commitment prune protection is only enabled after the ramp reaches full strength.
+
+Validated outcome from the timing runs:
+
+- in the updated structural smoke run, the visible early slow step was **not** caused by structural commitment; the logs showed structural `scale=0.000` throughout warmup,
+- the main early spikes before initialization were ordinary MonoGS lifecycle events:
+  - densify around `iter=200` and `iter=350`,
+  - `Performing initial BA for initialization` once the window first reached 8 keyframes,
+- in the updated structural run, MonoGS reported `Initialized SLAM` at about `iter=788`,
+- immediately after that boundary, the structural phase switched to explicit `delay`, not `live`,
+- later in deep live mapping, the structural path added only a bounded extra cost on top of rendering:
+  - typical `struct_ms` was about `4-6 ms`,
+  - typical `render_ms` remained the dominant cost at roughly `10-30 ms`,
+  - dense-event iterations remained dominated by render/prune/densify rather than the structural term,
+- a baseline timing run with structural commitment disabled showed the same pre-init densify and initialization-region slow events, confirming that the early stall is a MonoGS lifecycle feature rather than a structural-only artifact.
+
+Interpretation:
+
+- the user's reported slow step and the beginning of structural divergence were previously conflated because they happened near the same part of the run,
+- the new logs separate them cleanly:
+  - the slow early step comes from MonoGS initialization / local map maintenance,
+  - the structural path used to begin too close to that boundary,
+  - the new delay/ramp keeps the two effects separated.
+
+This does **not** yet prove that long-horizon convergence is fixed, but it removes the strongest early confound and gives a much cleaner basis for the next GUI validation pass.
+
 ## Implemented Components
 
 ### 1. Persistent Gaussian state
@@ -185,7 +238,7 @@ Implemented:
 Guardrail:
 
 - size-based safeguards remain active even for high-commitment Gaussians.
-- structural commitment updates and commitment-aware pruning/protection are now delayed until MonoGS reports `Initialized SLAM`, so the fragile initialization phase stays closer to baseline behavior.
+- structural commitment updates and commitment-aware pruning/protection are now delayed until MonoGS reports `Initialized SLAM`, and then further delayed/ramped for a fixed number of iterations so the fragile post-init settling phase stays closer to baseline behavior.
 
 ## Config Surface
 
@@ -199,6 +252,10 @@ Shared base and live configs now expose:
 - `commitment_chunk_size`
 - `commitment_max_points`
 - `commitment_log_every`
+- `commitment_start_after_init_iters`
+- `commitment_ramp_iters`
+- `map_timing_log_every`
+- `map_slow_iteration_ms`
 - `lambda_coh`
 - `lambda_thin`
 - `commitment_prune_bias`
@@ -210,6 +267,7 @@ Current default posture:
 - the added values are conservative placeholders for opt-in experiments,
 - the shared opt-in default for `lambda_coh` is now `0.5` after live diagnostics showed that `0.1` left coherence too weak to matter,
 - the shared opt-in default for `commitment_stable_quantile` is now `0.75`,
+- the shared opt-in defaults now delay structural activation by `100` iterations after MonoGS initialization and ramp it over the next `200` iterations,
 - the shared opt-in default for `commitment_protect_threshold` is now `0.85` so only a smaller anchor subset affects lifecycle decisions.
 
 Example opt-in config:
@@ -224,6 +282,7 @@ Validated:
 - baseline Pixi smoke test on TUM FR1 Desk with `configs/mono/tum/fr1_desk_baseline_smoke.yaml`
 - structural Pixi smoke tests on TUM FR1 Desk with `configs/mono/tum/fr1_desk_structural_commitment_smoke.yaml`
 - GUI startup validation through Pixi with the same structural smoke configuration and `DISPLAY=:0`
+- timing-instrumented structural and baseline Pixi smoke runs on TUM FR1 Desk to isolate the early slow iteration from structural activation
 
 Runtime observations from the smoke tests:
 
@@ -240,6 +299,11 @@ Runtime observations from the smoke tests:
 - after the sparse-anchor revision, the structural smoke run completed cleanly in about `100.68s` total time at about `5.88 FPS`,
 - after that revision, `proposal_mean` was about `0.1250`, commitment mean stayed near `0.1`, and protected-Gaussian counts stayed in the low hundreds instead of the low thousands,
 - the corrected commitment-weighted `coh_ratio` now reports about `1e-3` to `1e-2` in early live mapping, which matches the intended anchor-sparse regime far better than the old unweighted proxy.
+- after the delayed-ramp change, the timing logs showed `Initialized SLAM` around `iter=788` in the structural smoke run, followed by explicit `phase=delay` rather than immediate structural activation,
+- in that updated structural timing run, the pre-init slow points were still densify / initialization-region events while `scale=0.000`, which strongly suggests the user's early slow-step observation is not caused by the structural term itself,
+- once the updated structural run reached full `phase=live`, `struct_ms` stayed bounded at roughly `4-6 ms` while total iteration time remained dominated by render and normal MonoGS lifecycle work,
+- the baseline timing run reproduced the same pre-init densify and initialization-region slow events with structural commitment fully disabled,
+- EuRoC smoke configs are now ready, but the actual EuRoC runtime comparison remains blocked because the official dataset host stalled during download from this machine.
 
 The runtime observability now exposes:
 
@@ -264,10 +328,14 @@ The runtime observability now exposes:
 4. The anchor subset is now much smaller, but some Gaussians still saturate near commitment `1.0`, so longer-run validation is still needed to see whether anchor identities remain sensible over time.
 5. The structural path now appears to cost roughly baseline-plus-some-headroom rather than baseline-times-six, but it is still measurably above baseline and should be profiled again on longer sequences.
 6. The existing isotropic scaling prior is still active alongside the thinness prior; their interaction should be evaluated experimentally.
+7. EuRoC cross-scene validation is currently blocked on dataset availability because the official host did not respond from this environment.
 
 ## Recommended Next Experiment
 
-1. Use the capped structural smoke config as the new safe starting point.
-2. Run the GUI configuration again with the sparse-anchor formulation and check whether the earlier visible divergence is reduced.
-3. Run the full FR1 Desk structural config and compare convergence against the baseline now that the short smoke run is stable.
-4. Profile structural memory again on a longer run to verify that the clean smoke-test memory picture holds outside the short validation sequence.
+1. Run the GUI configuration again with the delayed-ramp structural formulation and watch whether drift still begins shortly after `Initialized SLAM`.
+2. If drift is still visible, tune the post-init schedule before retuning the losses:
+   - first `commitment_start_after_init_iters`,
+   - then `commitment_ramp_iters`,
+   - only then `lambda_thin` or `lambda_coh`.
+3. Run the full FR1 Desk structural config and compare convergence against the baseline now that initialization and structural activation are cleanly separated in the logs.
+4. Resolve EuRoC dataset access, then repeat the same baseline-vs-structural timing comparison on `MH_02_easy` to check whether the divergence remains scene-sensitive.

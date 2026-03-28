@@ -38,6 +38,8 @@ class BackEnd(mp.Process):
         self.current_window = []
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
+        self.initialized_at_iteration = 0 if self.initialized else None
+        self.last_structural_phase = None
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -84,6 +86,18 @@ class BackEnd(mp.Process):
         self.commitment_log_every = self.config["Training"].get(
             "commitment_log_every", 50
         )
+        self.commitment_start_after_init_iters = self.config["Training"].get(
+            "commitment_start_after_init_iters", 100
+        )
+        self.commitment_ramp_iters = self.config["Training"].get(
+            "commitment_ramp_iters", 200
+        )
+        self.map_timing_log_every = self.config["Training"].get(
+            "map_timing_log_every", 0
+        )
+        self.map_slow_iteration_ms = self.config["Training"].get(
+            "map_slow_iteration_ms", 250.0
+        )
         self.single_thread = (
             self.config["Dataset"]["single_thread"]
             if "single_thread" in self.config["Dataset"]
@@ -105,6 +119,110 @@ class BackEnd(mp.Process):
         for visibility_filter in visibility_filters:
             active_mask |= visibility_filter
         return active_mask
+
+    def _get_structural_phase(self):
+        if not self.use_structural_commitment or self.gaussians is None:
+            return 0.0, "disabled", 0
+        if self.gaussians.get_xyz.shape[0] == 0:
+            return 0.0, "empty", 0
+        if self.initialized_at_iteration is None:
+            return 0.0, "warmup", 0
+
+        live_iters = max(0, self.iteration_count - self.initialized_at_iteration)
+        if live_iters < self.commitment_start_after_init_iters:
+            return 0.0, "delay", live_iters
+
+        if self.commitment_ramp_iters <= 0:
+            return 1.0, "live", live_iters
+
+        ramp_iters = live_iters - self.commitment_start_after_init_iters + 1
+        structural_scale = min(1.0, ramp_iters / self.commitment_ramp_iters)
+        structural_phase = "ramp" if structural_scale < 1.0 else "live"
+        return structural_scale, structural_phase, live_iters
+
+    def _maybe_log_structural_phase(self, structural_phase, structural_scale, live_iters):
+        if structural_phase == self.last_structural_phase:
+            return
+
+        self.last_structural_phase = structural_phase
+        Log(
+            "Structural phase",
+            f"iter={self.iteration_count}",
+            f"phase={structural_phase}",
+            f"scale={structural_scale:.3f}",
+            f"live_iters={live_iters}",
+            f"start_after={self.commitment_start_after_init_iters}",
+            f"ramp_iters={self.commitment_ramp_iters}",
+        )
+
+    def _should_log_map_timing(
+        self, iter_ms, prune, update_gaussian, opacity_reset, structural_phase
+    ):
+        if (
+            self.map_timing_log_every > 0
+            and self.iteration_count % self.map_timing_log_every == 0
+        ):
+            return True
+        if prune or update_gaussian or opacity_reset:
+            return True
+        if iter_ms >= self.map_slow_iteration_ms:
+            return True
+        if structural_phase in {"delay", "ramp", "live"} and self.last_sent <= 1:
+            return True
+        return False
+
+    def _log_map_timing(
+        self,
+        prune,
+        structural_phase,
+        structural_scale,
+        live_iters,
+        render_ms,
+        structural_ms,
+        densify_ms,
+        opacity_reset_ms,
+        optimizer_ms,
+        iter_ms,
+        update_gaussian,
+        opacity_reset,
+        point_count_before,
+        point_count_after,
+        active_count,
+        regularizer_count,
+    ):
+        if not self._should_log_map_timing(
+            iter_ms, prune, update_gaussian, opacity_reset, structural_phase
+        ):
+            return
+
+        event_tokens = []
+        if prune:
+            event_tokens.append("prune")
+        if update_gaussian:
+            event_tokens.append("densify")
+        if opacity_reset:
+            event_tokens.append("opacity_reset")
+        if not event_tokens:
+            event_tokens.append("iteration")
+
+        Log(
+            "Map timing",
+            f"iter={self.iteration_count}",
+            f"events={'+'.join(event_tokens)}",
+            f"phase={structural_phase}",
+            f"scale={structural_scale:.3f}",
+            f"live_iters={live_iters}",
+            f"window={len(self.current_window)}",
+            f"points={point_count_before}->{point_count_after}",
+            f"active={active_count}",
+            f"regularizer={regularizer_count}",
+            f"render_ms={render_ms:.1f}",
+            f"struct_ms={structural_ms:.1f}",
+            f"densify_ms={densify_ms:.1f}",
+            f"opacity_ms={opacity_reset_ms:.1f}",
+            f"optim_ms={optimizer_ms:.1f}",
+            f"iter_ms={iter_ms:.1f}",
+        )
 
     def _build_local_knn(self, xyz):
         num_points = xyz.shape[0]
@@ -332,6 +450,9 @@ class BackEnd(mp.Process):
         commitment_proposals,
         regularizer_count,
         debug_stats,
+        structural_phase,
+        structural_scale,
+        live_iters,
     ):
         if (
             not self.use_structural_commitment
@@ -373,7 +494,9 @@ class BackEnd(mp.Process):
         Log(
             "Structural commitment",
             f"iter={self.iteration_count}",
-            f"lifecycle={'live' if self.initialized else 'warmup'}",
+            f"phase={structural_phase}",
+            f"scale={structural_scale:.3f}",
+            f"live_iters={live_iters}",
             f"photo={photo_loss.detach().item():.6f}",
             f"coh={loss_coh.detach().item():.3e}",
             f"thin={loss_thin.detach().item():.6f}",
@@ -413,6 +536,8 @@ class BackEnd(mp.Process):
         self.viewpoints = {}
         self.current_window = []
         self.initialized = not self.monocular
+        self.initialized_at_iteration = 0 if self.initialized else None
+        self.last_structural_phase = None
         self.keyframe_optimizers = None
 
         # remove all gaussians
@@ -494,12 +619,20 @@ class BackEnd(mp.Process):
         for _ in range(iters):
             self.iteration_count += 1
             self.last_sent += 1
+            iter_start = time.perf_counter()
 
             photo_loss = self.gaussians.get_xyz.new_tensor(0.0)
             viewspace_point_tensor_acm = []
             visibility_filter_acm = []
             radii_acm = []
             n_touched_acm = []
+            point_count_before = int(self.gaussians.get_xyz.shape[0])
+            render_ms = 0.0
+            structural_ms = 0.0
+            densify_ms = 0.0
+            opacity_reset_ms = 0.0
+            optimizer_ms = 0.0
+            opacity_reset = False
 
             keyframes_opt = []
 
@@ -564,6 +697,7 @@ class BackEnd(mp.Process):
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
 
+            render_ms = (time.perf_counter() - iter_start) * 1000.0
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss_mapping = photo_loss + 10 * isotropic_loss.mean()
@@ -575,12 +709,13 @@ class BackEnd(mp.Process):
             commitment_proposals = None
             regularizer_count = 0
             debug_stats = None
-            structural_live = (
-                self.use_structural_commitment
-                and self.initialized
-                and self.gaussians.get_xyz.shape[0] > 0
+            structural_scale, structural_phase, live_iters = self._get_structural_phase()
+            self._maybe_log_structural_phase(
+                structural_phase, structural_scale, live_iters
             )
+            structural_live = structural_scale > 0.0
             if structural_live:
+                structural_start = time.perf_counter()
                 photo_xyz_grad = (
                     None
                     if self.gaussians._xyz.grad is None
@@ -596,9 +731,12 @@ class BackEnd(mp.Process):
                 ) = self._compute_structural_commitment_terms(
                     photo_xyz_grad, visibility_filter_acm
                 )
-                structural_loss = self.lambda_coh * loss_coh + self.lambda_thin * loss_thin
+                structural_loss = structural_scale * (
+                    self.lambda_coh * loss_coh + self.lambda_thin * loss_thin
+                )
                 if structural_loss.requires_grad:
                     structural_loss.backward()
+                structural_ms = (time.perf_counter() - structural_start) * 1000.0
             gaussian_split = False
             ## Deinsifying / Pruning Gaussians
             with torch.no_grad():
@@ -610,13 +748,15 @@ class BackEnd(mp.Process):
 
                 if (
                     self.use_structural_commitment
-                    and self.initialized
+                    and structural_scale > 0.0
                     and active_mask is not None
                     and commitment_proposals is not None
                     and commitment_proposals.numel() > 0
                 ):
                     self.gaussians.update_structural_commitment(
-                        active_mask, commitment_proposals, self.commitment_alpha
+                        active_mask,
+                        commitment_proposals,
+                        self.commitment_alpha * structural_scale,
                     )
                     self._log_structural_commitment_status(
                         photo_loss,
@@ -626,6 +766,9 @@ class BackEnd(mp.Process):
                         commitment_proposals,
                         regularizer_count,
                         debug_stats,
+                        structural_phase,
+                        structural_scale,
+                        live_iters,
                     )
 
                 # # compute the visibility of the gaussians
@@ -653,7 +796,7 @@ class BackEnd(mp.Process):
                         if (
                             to_prune is not None
                             and self.use_structural_commitment
-                            and self.initialized
+                            and structural_scale >= 1.0
                             and self.gaussians.get_structural_commitment.numel() > 0
                         ):
                             protected = (
@@ -670,7 +813,34 @@ class BackEnd(mp.Process):
                                 )
                         if not self.initialized:
                             self.initialized = True
+                            self.initialized_at_iteration = self.iteration_count
+                            self.last_structural_phase = None
                             Log("Initialized SLAM")
+                        point_count_after = int(self.gaussians.get_xyz.shape[0])
+                        iter_ms = (time.perf_counter() - iter_start) * 1000.0
+                        active_count = (
+                            int(active_mask.sum().item())
+                            if active_mask is not None
+                            else 0
+                        )
+                        self._log_map_timing(
+                            prune,
+                            structural_phase,
+                            structural_scale,
+                            live_iters,
+                            render_ms,
+                            structural_ms,
+                            densify_ms,
+                            opacity_reset_ms,
+                            optimizer_ms,
+                            iter_ms,
+                            False,
+                            False,
+                            point_count_before,
+                            point_count_after,
+                            active_count,
+                            regularizer_count,
+                        )
                         # # make sure we don't split the gaussians, break here.
                     return False
 
@@ -688,26 +858,33 @@ class BackEnd(mp.Process):
                     == self.gaussian_update_offset
                 )
                 if update_gaussian:
+                    densify_start = time.perf_counter()
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
                         self.gaussian_th,
                         self.gaussian_extent,
                         self.size_threshold,
                         commitment_prune_bias=self.commitment_prune_bias
-                        if self.use_structural_commitment and self.initialized
-                        else 0.0,
+                        * structural_scale,
                         commitment_protect_threshold=self.commitment_protect_threshold,
                     )
+                    densify_ms = (time.perf_counter() - densify_start) * 1000.0
                     gaussian_split = True
 
                 ## Opacity reset
                 if (self.iteration_count % self.gaussian_reset) == 0 and (
                     not update_gaussian
                 ):
+                    opacity_reset_start = time.perf_counter()
                     Log("Resetting the opacity of non-visible Gaussians")
                     self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
+                    opacity_reset_ms = (
+                        time.perf_counter() - opacity_reset_start
+                    ) * 1000.0
+                    opacity_reset = True
                     gaussian_split = True
 
+                optimizer_start = time.perf_counter()
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(self.iteration_count)
@@ -719,6 +896,30 @@ class BackEnd(mp.Process):
                     if viewpoint.uid == 0:
                         continue
                     update_pose(viewpoint)
+                optimizer_ms = (time.perf_counter() - optimizer_start) * 1000.0
+                point_count_after = int(self.gaussians.get_xyz.shape[0])
+                iter_ms = (time.perf_counter() - iter_start) * 1000.0
+                active_count = (
+                    int(active_mask.sum().item()) if active_mask is not None else 0
+                )
+                self._log_map_timing(
+                    prune,
+                    structural_phase,
+                    structural_scale,
+                    live_iters,
+                    render_ms,
+                    structural_ms,
+                    densify_ms,
+                    opacity_reset_ms,
+                    optimizer_ms,
+                    iter_ms,
+                    update_gaussian,
+                    opacity_reset,
+                    point_count_before,
+                    point_count_after,
+                    active_count,
+                    regularizer_count,
+                )
         return gaussian_split
 
     def color_refinement(self):

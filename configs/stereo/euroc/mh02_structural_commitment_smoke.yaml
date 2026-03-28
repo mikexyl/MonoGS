@@ -1,4 +1,4 @@
-inherit_from: "configs/mono/tum/fr1_desk_structural_commitment.yaml"
+inherit_from: "configs/stereo/euroc/mh02_structural_commitment.yaml"
 
 Results:
   use_gui: False
