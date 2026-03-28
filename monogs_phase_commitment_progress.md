@@ -288,6 +288,43 @@ Interpretation:
 - the current build is now much closer to the intended "field exists, trust gates how rigid it becomes" behavior,
 - but the next question is visual rather than purely scalar: whether this restored solid subset actually helps the far-side table traversal, or whether it has again become too rigid later in the sequence.
 
+Update: 2026-03-28 (GUI verdict on checkpoint `ed72cc0`)
+
+The next step after the trust-weighted field fix was a direct GUI inspection on the monocular TUM FR1 Desk run using:
+
+- pushed checkpoint `ed72cc0`,
+- `configs/mono/tum/fr1_desk_structural_commitment_gui_smoke.yaml`,
+- Pixi with `DISPLAY=:0`.
+
+User-visible outcome:
+
+- the map looked **slightly better** than the previous field-driven version,
+- but it still **diverged visually**,
+- so the current checkpoint is an improvement, not a solution.
+
+What this checkpoint now establishes with reasonable confidence:
+
+- the current failure is **not** "structural commitment hardens the map during initialization",
+- the current failure is also **not** the earlier "solid subset collapses to nearly zero" bug from the overly multiplicative trust gate,
+- the current build does produce a real operative solid subset in live mode,
+- but that restored solid subset is still not enough to carry the monocular trajectory robustly through the difficult far-side table traversal.
+
+Representative live values from the current checkpoint during the validated headless and GUI-linked runs:
+
+- `field_mean` is typically around `0.06-0.08`,
+- `field_max` is typically around `0.42-0.55`,
+- `trust_mean` is typically around `0.04-0.06`,
+- `solid_mean` is typically around `0.008-0.012`,
+- `solid_max` is typically around `0.33-0.42`,
+- sampled damping is active on a large subset (`damped` often around `179-205`),
+- the protection count is no longer zero-only, but still modest (single digits to low teens rather than thousands).
+
+Interpretation:
+
+- the current method is now in a more plausible regime: there is a real but selective structural subset, and it is not activating during initialization,
+- the slight visual improvement reported by the user is consistent with that regime change,
+- however, the far-side table failure remains, which means the present formulation still does not provide enough correct long-horizon geometric stabilization for the hard monocular viewpoint transition.
+
 ## Implemented Components
 
 ### 1. Persistent Gaussian state
@@ -483,18 +520,28 @@ The runtime observability now exposes:
 1. The current kNN field is local and active-set-only, not a full-map continuous splat field.
 2. Coherence is realized as a target-position regularizer, not explicit optimizer-step blending.
 3. The coherence term is no longer large once commitment is made sparse; the next question is whether it is now too weak to improve geometry on longer runs.
-4. The anchor subset is now much smaller, but some Gaussians still saturate near commitment `1.0`, so longer-run validation is still needed to see whether anchor identities remain sensible over time.
-5. The structural path now appears to cost roughly baseline-plus-some-headroom rather than baseline-times-six, but it is still measurably above baseline and should be profiled again on longer sequences.
-6. The existing isotropic scaling prior is still active alongside the thinness prior; their interaction should be evaluated experimentally.
-7. EuRoC cross-scene validation is currently blocked on dataset availability because the official host did not respond from this environment.
-8. The anchor-rest ratio diagnostic is currently only a coarse scale-comparison heuristic; it is useful for relative tuning, but not yet a calibrated physical metric.
+4. The current trust-weighted field gate gives a real solid subset again, but the user still observed visual divergence on the far-side table traversal, so the operative solidness is not yet translating into sufficient scene-level stability.
+5. The anchor subset is now much smaller than in the earlier over-protected build, but some Gaussians still saturate near commitment `1.0`, so longer-run validation is still needed to see whether anchor identities remain sensible over time.
+6. The current anchor-rest contribution can become large relative to the raw step scale in some live segments, which suggests the next revision should look at how anchor-rest influence is scheduled or normalized during hard viewpoint transitions rather than only at whether anchors exist.
+7. The structural path now appears to cost roughly baseline-plus-some-headroom rather than baseline-times-six, but it is still measurably above baseline and should be profiled again on longer sequences.
+8. The existing isotropic scaling prior is still active alongside the thinness prior; their interaction should be evaluated experimentally.
+9. EuRoC cross-scene validation is currently blocked on dataset availability because the official host did not respond from this environment.
+10. The anchor-rest ratio diagnostic is currently only a coarse scale-comparison heuristic; it is useful for relative tuning, but not yet a calibrated physical metric.
 
 ## Recommended Next Experiment
 
-1. Judge the current GUI run on the far-side table traversal under the anchor-rest formulation.
-2. If drift is still visible, tune the anchor-rest and scheduling terms before returning to thinness:
-   - first `lambda_anchor`,
-   - then `commitment_anchor_alpha`,
-   - then `commitment_start_after_init_iters` / `commitment_ramp_iters`.
-3. Only after that, retune `lambda_thin` or the sparse-anchor commitment proposal itself.
-4. Resolve EuRoC dataset access, then repeat the same baseline-vs-structural timing comparison on `MH_02_easy` to check whether the divergence remains scene-sensitive.
+1. Resume from checkpoint `ed72cc0`, which is the current best-documented monocular structural-commitment build.
+2. Keep the current post-init delay and trust-weighted field gate as the starting point; do not go back to the old full-product trust rule or the earlier aggressive scene-specific damping override.
+3. Focus the next revision on how anchor-rest influence behaves during difficult viewpoint transitions:
+   - first inspect whether `lambda_anchor` is still too strong once solidness becomes nontrivial,
+   - then inspect whether `commitment_anchor_alpha` updates the anchor memory too slowly or too quickly through the table-crossing segment,
+   - then inspect whether anchor-rest should be applied more selectively when support drops sharply even if field commitment remains high.
+4. Only after that, retune `lambda_thin` or the sparse-anchor commitment proposal itself.
+5. Resolve EuRoC dataset access, then repeat the same baseline-vs-structural timing comparison on `MH_02_easy` to check whether the divergence remains scene-sensitive.
+
+## Resume Checkpoint
+
+- Best current checkpoint: `ed72cc0`
+- Visual verdict: slight improvement, still diverging
+- Most likely current bottleneck: later-phase structural behavior during the hard far-side monocular transition, not initialization
+- Most important validated negative result: initialization over-solidification is not the active bug in the current build
