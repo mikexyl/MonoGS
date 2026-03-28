@@ -45,6 +45,7 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
         self.structural_commitment = torch.empty((0, 1), device="cuda")
+        self.structural_anchor_xyz = torch.empty((0, 3), device="cuda")
 
         self.unique_kfIDs = torch.empty(0).int()
         self.n_obs = torch.empty(0).int()
@@ -104,6 +105,10 @@ class GaussianModel:
     @property
     def get_structural_commitment(self):
         return self.structural_commitment
+
+    @property
+    def get_structural_anchor_xyz(self):
+        return self.structural_anchor_xyz
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(
@@ -339,6 +344,9 @@ class GaussianModel:
         for i in range(self._rotation.shape[1]):
             l.append("rot_{}".format(i))
         l.append("structural_commitment")
+        l.append("anchor_x")
+        l.append("anchor_y")
+        l.append("anchor_z")
         return l
 
     def save_ply(self, path):
@@ -366,6 +374,7 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
         structural_commitment = self.structural_commitment.detach().cpu().numpy()
+        structural_anchor_xyz = self.structural_anchor_xyz.detach().cpu().numpy()
 
         dtype_full = [
             (attribute, "f4") for attribute in self.construct_list_of_attributes()
@@ -381,6 +390,7 @@ class GaussianModel:
                 scale,
                 rotation,
                 structural_commitment,
+                structural_anchor_xyz,
             ),
             axis=1,
         )
@@ -470,6 +480,20 @@ class GaussianModel:
             structural_commitment = np.full(
                 (xyz.shape[0], 1), self.commitment_init_value, dtype=np.float32
             )
+        if all(
+            name in plydata.elements[0].data.dtype.names
+            for name in ("anchor_x", "anchor_y", "anchor_z")
+        ):
+            structural_anchor_xyz = np.stack(
+                (
+                    np.asarray(plydata.elements[0]["anchor_x"]),
+                    np.asarray(plydata.elements[0]["anchor_y"]),
+                    np.asarray(plydata.elements[0]["anchor_z"]),
+                ),
+                axis=1,
+            )
+        else:
+            structural_anchor_xyz = xyz.copy()
 
         self._xyz = nn.Parameter(
             torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
@@ -501,6 +525,9 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
         self.structural_commitment = torch.tensor(
             structural_commitment, dtype=torch.float, device="cuda"
+        )
+        self.structural_anchor_xyz = torch.tensor(
+            structural_anchor_xyz, dtype=torch.float, device="cuda"
         )
         self.unique_kfIDs = torch.zeros((self._xyz.shape[0]))
         self.n_obs = torch.zeros((self._xyz.shape[0]), device="cpu").int()
@@ -558,6 +585,7 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.structural_commitment = self.structural_commitment[valid_points_mask]
+        self.structural_anchor_xyz = self.structural_anchor_xyz[valid_points_mask]
         self.unique_kfIDs = self.unique_kfIDs[valid_points_mask.cpu()]
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
 
@@ -606,6 +634,7 @@ class GaussianModel:
         new_kf_ids=None,
         new_n_obs=None,
         new_structural_commitment=None,
+        new_structural_anchor_xyz=None,
     ):
         d = {
             "xyz": new_xyz,
@@ -634,8 +663,13 @@ class GaussianModel:
                 dtype=torch.float32,
                 device="cuda",
             )
+        if new_structural_anchor_xyz is None:
+            new_structural_anchor_xyz = new_xyz.detach().clone()
         self.structural_commitment = torch.cat(
             (self.structural_commitment, new_structural_commitment), dim=0
+        )
+        self.structural_anchor_xyz = torch.cat(
+            (self.structural_anchor_xyz, new_structural_anchor_xyz), dim=0
         )
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
@@ -669,6 +703,7 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
         new_commitment = self.structural_commitment[selected_pts_mask].repeat(N, 1)
+        new_anchor_xyz = self.structural_anchor_xyz[selected_pts_mask].repeat(N, 1)
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()].repeat(N)
         new_n_obs = self.n_obs[selected_pts_mask.cpu()].repeat(N)
@@ -683,6 +718,7 @@ class GaussianModel:
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
             new_structural_commitment=new_commitment,
+            new_structural_anchor_xyz=new_anchor_xyz,
         )
 
         prune_filter = torch.cat(
@@ -712,6 +748,7 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_commitment = self.structural_commitment[selected_pts_mask]
+        new_anchor_xyz = self.structural_anchor_xyz[selected_pts_mask]
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()]
         new_n_obs = self.n_obs[selected_pts_mask.cpu()]
@@ -725,6 +762,7 @@ class GaussianModel:
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
             new_structural_commitment=new_commitment,
+            new_structural_anchor_xyz=new_anchor_xyz,
         )
 
     def densify_and_prune(
@@ -792,3 +830,20 @@ class GaussianModel:
             (1.0 - alpha) * self.structural_commitment[active_mask]
             + alpha * proposals
         ).clamp_(0.0, 1.0)
+
+    def update_structural_anchor_state(self, active_mask, weights, alpha):
+        if (
+            self.structural_anchor_xyz.numel() == 0
+            or active_mask.numel() == 0
+            or not active_mask.any()
+            or alpha <= 0.0
+        ):
+            return
+
+        weights = weights.view(-1, 1).clamp_(0.0, 1.0)
+        blend = (alpha * weights).clamp_(0.0, 1.0)
+        active_xyz = self.get_xyz.detach()[active_mask]
+        self.structural_anchor_xyz[active_mask] = (
+            (1.0 - blend) * self.structural_anchor_xyz[active_mask]
+            + blend * active_xyz
+        )

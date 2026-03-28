@@ -89,6 +89,13 @@ Interpretation:
 - Gaussians outside that stable tail receive \(q_i \approx 0\) and therefore decay back toward the exploratory state,
 - commitment is therefore sparse by design, which is much closer to the intended two-type behavior.
 
+In the current implementation, this stable-tail proposal is also modulated by a local observation-support factor derived from recent SLAM-window visibility counts. That means the method prefers Gaussians that are both:
+
+- relatively stable under the current photometric gradient,
+- and repeatedly re-observed rather than merely quiet for one iteration.
+
+This is important when the camera moves around the table or revisits the scene from a new side: anchor candidates should be persistent structure, not just low-gradient points from the currently easiest view.
+
 ### 3.2 Soft online update
 
 We update structural commitment with an exponential moving average:
@@ -176,14 +183,17 @@ This is especially natural in SLAM:
 - repeatedly re-observed Gaussians should become stable map support,
 - inconsistent Gaussians should remain flexible or be pruned.
 
-In the current MonoGS implementation, this is used as an **interpretive target**, not as a literal overwrite of Adam's xyz step. The implementation realizes the effect through:
+In the current MonoGS implementation, this is used as an **interpretive target** realized through a hybrid of structural losses and direct motion damping. The implementation now uses:
 
+- a field-smoothed solidness estimate rather than treating each Gaussian's stored commitment as an isolated label,
 - a coherence loss that encourages committed Gaussians to align with local consensus motion,
+- a persistent anchor-rest state for committed Gaussians,
 - a thinness prior localized by the commitment interface,
+- direct xyz-gradient damping for the most solid part of the field,
 - commitment-aware pruning bias and anchor protection,
 - the post-initialization delay/ramp schedule above.
 
-That choice keeps the optimizer plumbing simpler and was empirically safer in the existing MonoGS codepath.
+This keeps the persistent state simple while letting the optimizer react to a spatially coherent solid/liquid split instead of a noisy per-Gaussian binary tendency.
 
 ### Coherence regularization
 
@@ -192,6 +202,63 @@ We add a coherence penalty:
 \mathcal{L}_{\text{coh}} = \sum_i s_i \, \left\| v_i - U(\mu_i) \right\|^2.
 \]
 This penalizes committed Gaussians that try to move differently from the local consensus motion.
+
+### Anchor-rest regularization
+
+For the structural subset, local consensus alone turned out to be too weak. So each Gaussian also carries a slowly updated anchor-rest position
+\[
+a_i^{(t)} \in \mathbb{R}^3,
+\]
+initialized from its current mean and inherited through cloning/splitting.
+
+Committed Gaussians are then penalized for drifting away from that persistent anchor memory:
+\[
+\mathcal{L}_{\text{anchor}} = \sum_i \phi(s_i) \left\|\frac{\mu_i - a_i}{\rho_i + \varepsilon}\right\|^2,
+\]
+where:
+
+- \(\phi(s_i)\) is a commitment-dependent weight,
+- \(\rho_i\) is a local neighborhood scale rather than the Gaussian's microscopic splat scale.
+
+The anchor-rest state is updated detached by a slow EMA:
+\[
+a_i^{(t+1)} = (1-\beta_i) a_i^{(t)} + \beta_i \mu_i^{(t)},
+\]
+with \(\beta_i\) small and modulated by commitment. This gives the "solid" Gaussians an actual memory of where they have been stable over time, which is especially useful when the camera crosses to a more weakly constrained side of the scene.
+
+### Field-smoothed solidness
+
+The stored commitment \(s_i\) is persistent state, but it is no longer treated as the immediate physical solidness. Instead, MonoGS builds a local field estimate
+\[
+\tilde{s}_i = (1-\eta) s_i + \eta \sum_{j \in \mathcal{N}(i)} \bar{w}_{ij} s_j,
+\]
+where \(\bar{w}_{ij}\) is the normalized kNN kernel and \(\eta\) is a smoothing factor.
+
+This follows the practical intuition that "solidness" should be attached to the local field around a surface patch, not to a single Gaussian in isolation. The persistent per-Gaussian state is therefore best viewed as a discretization of that local field, not as the field itself.
+
+In the implementation, \(\tilde{s}_i\) is what drives:
+
+- coherence weighting,
+- anchor-rest weighting,
+- commitment-interface estimation,
+- direct motion damping.
+
+This makes neighboring anchor candidates reinforce each other instead of hardening independently.
+
+### Direct optimizer damping
+
+The loss terms above still allow the photometric update to move the solid subset too freely in difficult view transitions. So the current MonoGS implementation also damps the xyz gradient directly for the upper tail of the field-solidness estimate:
+\[
+g_i^{xyz} \leftarrow (1-d_i)\, g_i^{xyz},
+\]
+with
+\[
+d_i = \gamma^{(t)} \lambda_{\text{damp}} \psi(\tilde{s}_i).
+\]
+
+Here \(\gamma^{(t)}\) is the post-init structural ramp and \(\psi\) is activated only above a field-relative threshold. In practice, the threshold is taken from the upper quantile of the current field, clipped by a configured ceiling, so damping tracks the solid subset even when field magnitudes differ across scenes.
+
+This is the first part of the implementation that directly modulates the optimizer step rather than only adding an auxiliary loss, and it is meant specifically to resist slow map drift when the camera goes around the far side of the table.
 
 ---
 
@@ -236,16 +303,17 @@ So unlike global surfel-like regularization, thinness is imposed only where stru
 
 At a MonoGS local mapping step, we optimize:
 \[
-\mathcal{L} = \mathcal{L}_{\text{photo}} + \lambda_{\text{coh}} \mathcal{L}_{\text{coh}} + \lambda_{\text{thin}} \mathcal{L}_{\text{thin}}.
+\mathcal{L} = \mathcal{L}_{\text{photo}} + \lambda_{\text{coh}} \mathcal{L}_{\text{coh}} + \lambda_{\text{anchor}} \mathcal{L}_{\text{anchor}} + \lambda_{\text{thin}} \mathcal{L}_{\text{thin}}.
 \]
 
 Roles of each term:
 
 - \(\mathcal{L}_{\text{photo}}\): image reconstruction and tracking consistency,
 - \(\mathcal{L}_{\text{coh}}\): coherent motion for committed Gaussians,
+- \(\mathcal{L}_{\text{anchor}}\): long-horizon stabilization of committed anchors against drift,
 - \(\mathcal{L}_{\text{thin}}\): interface-localized surface shaping.
 
-The key simplification is that structural commitment itself is updated from **relative photometric stability**, but only the stable tail is allowed to harden into anchors. This keeps the method close to the two-type Gaussian idea without introducing a hard discrete label.
+After differentiating this objective, the current implementation also applies field-relative xyz-gradient damping to the solid upper tail before the optimizer step. The key simplification is that structural commitment itself is still updated from **relative photometric stability**, but only the stable tail is allowed to harden into anchors. This keeps the method close to the two-type Gaussian idea without introducing a hard discrete label.
 
 ---
 
@@ -260,13 +328,14 @@ For each local mapping iteration:
    Compute raw mean updates \(\Delta \mu_i^{\text{photo}}\) and mean-gradient magnitudes \(g_i\).
 
 3. **Build commitment-aware fields**  
-   Using current \(s_i\), build \(\mathcal{S}(x)\), \(U(x)\), and \(\nabla \mathcal{S}(\mu_i)\).
+   Using current persistent \(s_i\), build a local field-solidness estimate \(\tilde{s}_i\), then use it to construct \(\mathcal{S}(x)\), \(U(x)\), and \(\nabla \mathcal{S}(\mu_i)\).
 
 4. **Commitment-modulated Gaussian optimization**  
    Optimize the Gaussian parameters under
    \[
-   \mathcal{L}_{\text{photo}} + \gamma^{(t)} \left(\lambda_{\text{coh}} \mathcal{L}_{\text{coh}} + \lambda_{\text{thin}} \mathcal{L}_{\text{thin}}\right).
+   \mathcal{L}_{\text{photo}} + \gamma^{(t)} \left(\lambda_{\text{coh}} \mathcal{L}_{\text{coh}} + \lambda_{\text{anchor}} \mathcal{L}_{\text{anchor}} + \lambda_{\text{thin}} \mathcal{L}_{\text{thin}}\right).
    \]
+   Then damp the xyz gradient of the solid upper tail according to the current field estimate before the optimizer step.
    In the current implementation, this is how the idealized commitment-modulated motion is realized in practice.
 
 5. **Detached commitment update**  

@@ -47,14 +47,22 @@ Training:
   commitment_alpha: 0.05
   commitment_knn: 8
   commitment_stable_quantile: 0.75
+  commitment_obs_weight: 0.5
   commitment_chunk_size: 256
   commitment_max_points: 2048
   commitment_log_every: 50
   commitment_start_after_init_iters: 100
   commitment_ramp_iters: 200
+  commitment_anchor_alpha: 0.01
+  commitment_field_smoothing: 0.75
+  commitment_motion_damping: 0.75
+  commitment_damping_threshold: 0.6
+  commitment_damping_quantile: 0.9
+  commitment_damping_power: 2.0
   map_timing_log_every: 0
   map_slow_iteration_ms: 250.0
   lambda_coh: 0.5
+  lambda_anchor: 0.5
   lambda_thin: 0.01
   commitment_prune_bias: 0.05
   commitment_protect_threshold: 0.85

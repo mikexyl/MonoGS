@@ -138,6 +138,89 @@ Interpretation:
 
 This does **not** yet prove that long-horizon convergence is fixed, but it removes the strongest early confound and gives a much cleaner basis for the next GUI validation pass.
 
+Update: 2026-03-28 (anchor-rest reformulation)
+
+The next user report was more specific again: even after separating initialization from structural activation, the map still diverged when the trajectory moved to the other side of the table.
+
+The live logs explained why the previous formulation was still insufficient:
+
+- `coh_w` remained effectively negligible,
+- `thin_w` was the only consistently material structural term,
+- the method therefore had shape pressure and some lifecycle bias, but still no real long-horizon stabilizer for the committed subset.
+
+That led to a second formulation change that remains faithful to the two-type idea:
+
+- a persistent per-Gaussian anchor-rest position was added to the Gaussian state,
+- committed Gaussians are now pulled toward that slow anchor memory through a new `lambda_anchor` term,
+- the anchor-rest state is updated detached by a slow EMA weighted by commitment,
+- commitment proposals are now additionally modulated by recent observation support from SLAM-window visibility counts, so anchor candidates are biased toward repeatedly re-observed structure rather than merely low-gradient points.
+
+State plumbing implemented:
+
+- `gaussian_splatting/scene/gaussian_model.py` now carries `structural_anchor_xyz`,
+- new Gaussians initialize anchor-rest from their current xyz,
+- clone/split inherit the parent anchor-rest state,
+- prune preserves it,
+- PLY save/load now round-trips the anchor-rest coordinates as `anchor_x`, `anchor_y`, `anchor_z`.
+
+Validation outcome so far:
+
+- the first anchor-rest smoke run proved the new term was finally material, but its initial normalization used the Gaussian's own splat scale and made the anchor loss too strong,
+- that was corrected by normalizing anchor drift with local neighborhood scale instead,
+- the clean recalibrated structural smoke then showed:
+  - `anchor_w` around `5e-3` to `1.3e-2`,
+  - `thin_w` around `2e-3`,
+  - `coh_w` still negligible,
+  - sparse commitment with only about `6-11` protected anchors in the sampled live region,
+  - `max` commitment above `0.94`, which means the structural subset is once again genuinely anchor-like rather than diffuse.
+
+Interpretation:
+
+- the structural term is now doing something qualitatively closer to the intended solid/liquid split,
+- the dominant stabilizer is no longer the interface-thinness prior,
+- the far-side table traversal now needs to be judged visually under this anchor-rest formulation rather than under the earlier weak-coherence version.
+
+Update: 2026-03-28 (field-solidness and adaptive damping)
+
+The next user observation was that the revised method still did not get past the table cleanly, and they suggested an important reformulation: treat "solidness" as a property of the local field rather than of each Gaussian independently.
+
+That is now reflected in the implementation.
+
+Formulation change:
+
+- persistent commitment is still stored per Gaussian for lifecycle, clone/split inheritance, and checkpointing,
+- but the optimizer no longer uses that raw state directly as the immediate physical solidness,
+- instead it builds a local kNN-smoothed field estimate and uses that field for coherence, anchor-rest weighting, interface estimation, and direct xyz damping,
+- the direct damping gate is no longer tied to a fixed raw commitment level alone; it is derived from the upper tail of the current field, capped by the configured threshold.
+
+Why this was necessary:
+
+- the first field-smoothed smoke showed the right qualitative behavior, but it also revealed that a fixed damping threshold of `0.6` was no longer appropriate,
+- after smoothing, `field_max` was typically only around `0.3-0.57` even when raw commitment `max` had become anchor-like again,
+- that meant the newly added direct damping path existed in code but remained inactive in practice.
+
+Implemented backend changes:
+
+- `utils/slam_backend.py` now computes a field-smoothed solidness estimate from the local kNN graph,
+- structural losses now use that field estimate instead of raw stored commitment,
+- xyz gradients are now damped directly on the sampled structural subset before the optimizer step,
+- the damping threshold is now logged explicitly and derived from the field's upper quantile (`commitment_damping_quantile`) rather than only from a fixed absolute level.
+
+Validation outcome so far:
+
+- the first smoke after the field refactor confirmed the problem clearly: `damping_mean=0`, `damped=0`, because the field never crossed the old absolute threshold,
+- after switching to the adaptive field-relative threshold, the headless TUM FR1 Desk smoke showed sustained non-zero damping in live mode,
+- representative live values from the clean smoke:
+  - around `iter=1210`: `field_max=0.3761`, `damping_threshold=0.1722`, `damping_mean=4.514e-04`, `damping_max=4.547e-02`, `damped=205`,
+  - around `iter=1240`: `field_max=0.4681`, `damping_threshold=0.1752`, `damping_mean=9.085e-04`, `damping_max=9.460e-02`, `damped=205`,
+  - around `iter=1300`: `field_max=0.3146`, `damping_threshold=0.1313`, `damping_mean=3.326e-04`, `damping_max=3.340e-02`, `damped=205`.
+
+Interpretation:
+
+- the structural subset is now acting more like a field-defined anchor region than like a few isolated committed splats,
+- the direct stabilizer is finally active during live mapping instead of being a dormant code path,
+- this does not yet prove that the table-crossing divergence is solved visually, but it does remove an important implementation gap: the method now actually exerts optimizer-side resistance where the field says the map should be solid.
+
 ## Implemented Components
 
 ### 1. Persistent Gaussian state
@@ -254,9 +337,12 @@ Shared base and live configs now expose:
 - `commitment_log_every`
 - `commitment_start_after_init_iters`
 - `commitment_ramp_iters`
+- `commitment_obs_weight`
+- `commitment_anchor_alpha`
 - `map_timing_log_every`
 - `map_slow_iteration_ms`
 - `lambda_coh`
+- `lambda_anchor`
 - `lambda_thin`
 - `commitment_prune_bias`
 - `commitment_protect_threshold`
@@ -268,6 +354,7 @@ Current default posture:
 - the shared opt-in default for `lambda_coh` is now `0.5` after live diagnostics showed that `0.1` left coherence too weak to matter,
 - the shared opt-in default for `commitment_stable_quantile` is now `0.75`,
 - the shared opt-in defaults now delay structural activation by `100` iterations after MonoGS initialization and ramp it over the next `200` iterations,
+- the shared opt-in defaults now also include observation-weighted commitment proposals and a slow anchor-rest EMA,
 - the shared opt-in default for `commitment_protect_threshold` is now `0.85` so only a smaller anchor subset affects lifecycle decisions.
 
 Example opt-in config:
@@ -304,6 +391,10 @@ Runtime observations from the smoke tests:
 - once the updated structural run reached full `phase=live`, `struct_ms` stayed bounded at roughly `4-6 ms` while total iteration time remained dominated by render and normal MonoGS lifecycle work,
 - the baseline timing run reproduced the same pre-init densify and initialization-region slow events with structural commitment fully disabled,
 - EuRoC smoke configs are now ready, but the actual EuRoC runtime comparison remains blocked because the official dataset host stalled during download from this machine.
+- after the anchor-rest reformulation, the first smoke run confirmed that the new stabilizer is finally material in live mapping, but it initially had excessive strength due to a bad scale normalization,
+- after recalibrating anchor normalization to local neighborhood scale, the clean smoke run showed `anchor_w` in the `5e-3` to `1.3e-2` band, which is stronger than `thin_w` but no longer pathological,
+- in that recalibrated live region, commitment remained sparse, with only a handful of protected anchors while `max` commitment still exceeded `0.94`,
+- an updated GUI run was launched on the recalibrated anchor-rest formulation for direct visual inspection of the far-side table traversal.
 
 The runtime observability now exposes:
 
@@ -329,13 +420,14 @@ The runtime observability now exposes:
 5. The structural path now appears to cost roughly baseline-plus-some-headroom rather than baseline-times-six, but it is still measurably above baseline and should be profiled again on longer sequences.
 6. The existing isotropic scaling prior is still active alongside the thinness prior; their interaction should be evaluated experimentally.
 7. EuRoC cross-scene validation is currently blocked on dataset availability because the official host did not respond from this environment.
+8. The anchor-rest ratio diagnostic is currently only a coarse scale-comparison heuristic; it is useful for relative tuning, but not yet a calibrated physical metric.
 
 ## Recommended Next Experiment
 
-1. Run the GUI configuration again with the delayed-ramp structural formulation and watch whether drift still begins shortly after `Initialized SLAM`.
-2. If drift is still visible, tune the post-init schedule before retuning the losses:
-   - first `commitment_start_after_init_iters`,
-   - then `commitment_ramp_iters`,
-   - only then `lambda_thin` or `lambda_coh`.
-3. Run the full FR1 Desk structural config and compare convergence against the baseline now that initialization and structural activation are cleanly separated in the logs.
+1. Judge the current GUI run on the far-side table traversal under the anchor-rest formulation.
+2. If drift is still visible, tune the anchor-rest and scheduling terms before returning to thinness:
+   - first `lambda_anchor`,
+   - then `commitment_anchor_alpha`,
+   - then `commitment_start_after_init_iters` / `commitment_ramp_iters`.
+3. Only after that, retune `lambda_thin` or the sparse-anchor commitment proposal itself.
 4. Resolve EuRoC dataset access, then repeat the same baseline-vs-structural timing comparison on `MH_02_easy` to check whether the divergence remains scene-sensitive.

@@ -69,7 +69,11 @@ class BackEnd(mp.Process):
         self.commitment_stable_quantile = self.config["Training"].get(
             "commitment_stable_quantile", 0.75
         )
+        self.commitment_obs_weight = self.config["Training"].get(
+            "commitment_obs_weight", 0.5
+        )
         self.lambda_coh = self.config["Training"].get("lambda_coh", 0.0)
+        self.lambda_anchor = self.config["Training"].get("lambda_anchor", 0.5)
         self.lambda_thin = self.config["Training"].get("lambda_thin", 0.0)
         self.commitment_prune_bias = self.config["Training"].get(
             "commitment_prune_bias", 0.0
@@ -91,6 +95,24 @@ class BackEnd(mp.Process):
         )
         self.commitment_ramp_iters = self.config["Training"].get(
             "commitment_ramp_iters", 200
+        )
+        self.commitment_anchor_alpha = self.config["Training"].get(
+            "commitment_anchor_alpha", 0.01
+        )
+        self.commitment_field_smoothing = self.config["Training"].get(
+            "commitment_field_smoothing", 0.75
+        )
+        self.commitment_motion_damping = self.config["Training"].get(
+            "commitment_motion_damping", 0.75
+        )
+        self.commitment_damping_threshold = self.config["Training"].get(
+            "commitment_damping_threshold", 0.6
+        )
+        self.commitment_damping_quantile = self.config["Training"].get(
+            "commitment_damping_quantile", 0.9
+        )
+        self.commitment_damping_power = self.config["Training"].get(
+            "commitment_damping_power", 2.0
         )
         self.map_timing_log_every = self.config["Training"].get(
             "map_timing_log_every", 0
@@ -139,6 +161,71 @@ class BackEnd(mp.Process):
         structural_scale = min(1.0, ramp_iters / self.commitment_ramp_iters)
         structural_phase = "ramp" if structural_scale < 1.0 else "live"
         return structural_scale, structural_phase, live_iters
+
+    def _apply_structural_motion_damping(self, structural_scale, debug_stats):
+        if (
+            structural_scale <= 0.0
+            or self.commitment_motion_damping <= 0.0
+            or self.gaussians is None
+            or self.gaussians._xyz.grad is None
+            or debug_stats is None
+            or "regularizer_idx" not in debug_stats
+            or "field_commitment" not in debug_stats
+        ):
+            return None
+
+        damping_idx = debug_stats["regularizer_idx"]
+        field_commitment = debug_stats["field_commitment"]
+        if damping_idx.numel() == 0 or field_commitment.numel() == 0:
+            return None
+
+        commitment = field_commitment.detach().view(-1)
+        threshold = torch.clamp(
+            torch.tensor(
+                self.commitment_damping_threshold,
+                device=commitment.device,
+                dtype=commitment.dtype,
+            ),
+            0.0,
+            1.0 - 1e-6,
+        )
+        damping_quantile = torch.clamp(
+            torch.tensor(
+                self.commitment_damping_quantile,
+                device=commitment.device,
+                dtype=commitment.dtype,
+            ),
+            0.0,
+            1.0,
+        )
+        if commitment.numel() > 1 and damping_quantile.item() < 1.0:
+            adaptive_threshold = torch.quantile(commitment, damping_quantile)
+            adaptive_threshold = adaptive_threshold.clamp_(0.1, 1.0 - 1e-6)
+            threshold = torch.minimum(threshold, adaptive_threshold)
+        anchor_strength = ((commitment - threshold) / (1.0 - threshold)).clamp_(0.0, 1.0)
+        if not anchor_strength.any():
+            return {
+                "damping_mean": commitment.new_tensor(0.0),
+                "damping_max": commitment.new_tensor(0.0),
+                "damped_points": 0,
+                "damping_threshold": threshold.detach(),
+            }
+
+        damping_strength = (
+            structural_scale
+            * self.commitment_motion_damping
+            * anchor_strength.pow(self.commitment_damping_power)
+        ).clamp_(0.0, 1.0)
+        damped_grad = self.gaussians._xyz.grad.index_select(0, damping_idx) * (
+            1.0 - damping_strength
+        ).unsqueeze(-1)
+        self.gaussians._xyz.grad.index_copy_(0, damping_idx, damped_grad)
+        return {
+            "damping_mean": damping_strength.mean().detach(),
+            "damping_max": damping_strength.max().detach(),
+            "damped_points": int((anchor_strength > 0).sum().item()),
+            "damping_threshold": threshold.detach(),
+        }
 
     def _maybe_log_structural_phase(self, structural_phase, structural_scale, live_iters):
         if structural_phase == self.last_structural_phase:
@@ -266,7 +353,7 @@ class BackEnd(mp.Process):
 
         return None, None
 
-    def _get_commitment_proposals(self, grad_norm):
+    def _get_commitment_proposals(self, grad_norm, observation_support=None):
         if grad_norm.numel() == 0:
             return grad_norm
         if grad_norm.numel() == 1:
@@ -293,28 +380,82 @@ class BackEnd(mp.Process):
         )
         # Only the stable tail accumulates commitment; the rest decay toward zero.
         proposals = (proposals - stable_quantile) / (1.0 - stable_quantile)
+        proposals = proposals.clamp_(0.0, 1.0)
+        if observation_support is not None and self.commitment_obs_weight > 0.0:
+            support = observation_support.clamp_(0.0, 1.0)
+            support_weight = torch.clamp(
+                torch.tensor(
+                    self.commitment_obs_weight,
+                    device=grad_norm.device,
+                    dtype=grad_norm.dtype,
+                ),
+                0.0,
+                1.0,
+            )
+            proposals = proposals * ((1.0 - support_weight) + support_weight * support)
         return proposals.clamp_(0.0, 1.0)
+
+    def _get_commitment_field(self, commitment, neighbor_idx, kernel):
+        if commitment.numel() == 0 or neighbor_idx is None:
+            return commitment.detach()
+
+        blend = torch.clamp(
+            torch.tensor(
+                self.commitment_field_smoothing,
+                device=commitment.device,
+                dtype=commitment.dtype,
+            ),
+            0.0,
+            1.0,
+        )
+        if blend.item() <= 0.0:
+            return commitment.detach()
+
+        neighbor_commitment = commitment[neighbor_idx].squeeze(-1)
+        neighbor_mean = (
+            kernel * neighbor_commitment
+        ).sum(dim=1, keepdim=True) / kernel.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return (
+            (1.0 - blend) * commitment.detach() + blend * neighbor_mean.detach()
+        ).clamp_(0.0, 1.0)
 
     def _compute_structural_commitment_terms(self, photo_xyz_grad, visibility_filters):
         zero = self.gaussians.get_xyz.new_tensor(0.0)
+        empty_idx = torch.empty((0,), dtype=torch.long, device=self.gaussians.get_xyz.device)
         active_mask = self._get_active_gaussian_mask(visibility_filters)
         if photo_xyz_grad is None or active_mask.numel() == 0 or not active_mask.any():
             return (
                 zero,
                 zero,
+                zero,
                 active_mask,
                 self.gaussians.get_xyz.new_empty((0,)),
                 0,
-                None,
+                {"regularizer_idx": empty_idx, "field_commitment": self.gaussians.get_xyz.new_empty((0,))},
             )
 
         active_idx = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
         active_grad = photo_xyz_grad[active_idx]
         grad_norm = torch.norm(active_grad.detach(), dim=1)
-        commitment_proposals = self._get_commitment_proposals(grad_norm)
+        observation_support = None
+        if self.commitment_obs_weight > 0.0:
+            observation_support = (
+                self.gaussians.n_obs[active_idx.cpu()]
+                .to(device=grad_norm.device, dtype=grad_norm.dtype)
+                .clamp_(min=0)
+                / max(float(self.window_size), 1.0)
+            )
+            observation_support = observation_support.clamp_(0.0, 1.0)
+        commitment_proposals = self._get_commitment_proposals(
+            grad_norm, observation_support
+        )
 
-        if active_idx.numel() <= 1 or (self.lambda_coh <= 0.0 and self.lambda_thin <= 0.0):
-            return zero, zero, active_mask, commitment_proposals, 0, None
+        if active_idx.numel() <= 1 or (
+            self.lambda_coh <= 0.0
+            and self.lambda_anchor <= 0.0
+            and self.lambda_thin <= 0.0
+        ):
+            return zero, zero, zero, active_mask, commitment_proposals, 0, None
 
         regularizer_idx = active_idx
         if (
@@ -331,6 +472,7 @@ class BackEnd(mp.Process):
             return (
                 zero,
                 zero,
+                zero,
                 active_mask,
                 commitment_proposals,
                 regularizer_count,
@@ -339,9 +481,11 @@ class BackEnd(mp.Process):
 
         xyz = self.gaussians.get_xyz[regularizer_idx]
         commitment = self.gaussians.get_structural_commitment[regularizer_idx]
+        anchor_xyz = self.gaussians.get_structural_anchor_xyz[regularizer_idx]
         neighbor_idx, neighbor_dist2 = self._build_local_knn(xyz)
         if neighbor_idx is None:
             return (
+                zero,
                 zero,
                 zero,
                 active_mask,
@@ -353,13 +497,15 @@ class BackEnd(mp.Process):
         disp = xyz[neighbor_idx] - xyz.unsqueeze(1)
         local_scale = neighbor_dist2[:, -1:].clamp_min(1e-6)
         kernel = torch.exp(-neighbor_dist2 / local_scale)
+        field_commitment = self._get_commitment_field(commitment, neighbor_idx, kernel)
+        field_commitment_detached = field_commitment.detach()
 
         sampled_grad = photo_xyz_grad[regularizer_idx]
         xyz_lr = max(self._get_xyz_lr(), 1e-6)
         photo_delta = (-xyz_lr * sampled_grad).detach()
-        neighbor_commitment = commitment[neighbor_idx].squeeze(-1)
+        neighbor_commitment = field_commitment_detached[neighbor_idx].squeeze(-1)
         neighbor_delta = photo_delta[neighbor_idx]
-        self_commitment = commitment.squeeze(-1)
+        self_commitment = field_commitment_detached.squeeze(-1)
         consensus_weights = kernel * neighbor_commitment
         weights = torch.cat((self_commitment.unsqueeze(1), consensus_weights), dim=1)
         delta_bank = torch.cat((photo_delta.unsqueeze(1), neighbor_delta), dim=1)
@@ -372,15 +518,25 @@ class BackEnd(mp.Process):
         if fallback.any():
             consensus_delta[fallback] = photo_delta[fallback]
 
-        commitment_detached = commitment.detach()
-        effective_delta = (1.0 - commitment_detached) * photo_delta + (
-            commitment_detached * consensus_delta.detach()
+        effective_delta = (1.0 - field_commitment_detached) * photo_delta + (
+            field_commitment_detached * consensus_delta.detach()
         )
         coherence_target = xyz.detach() + effective_delta
         coherence_residual = xyz - coherence_target
         loss_coh = (
-            commitment_detached * coherence_residual.pow(2).sum(dim=1, keepdim=True)
+            field_commitment_detached
+            * coherence_residual.pow(2).sum(dim=1, keepdim=True)
         ).mean() / xyz_lr
+
+        scaling = self.gaussians.get_scaling[regularizer_idx]
+        if scaling.shape[-1] == 1:
+            scaling = scaling.repeat(1, 3)
+        anchor_scale = local_scale.sqrt().detach().clamp_min(1e-3)
+        anchor_residual = (xyz - anchor_xyz.detach()) / anchor_scale
+        anchor_weight = field_commitment_detached.pow(2)
+        loss_anchor = (
+            anchor_weight * anchor_residual.pow(2).sum(dim=1, keepdim=True)
+        ).mean()
 
         commitment_delta = neighbor_commitment - self_commitment.unsqueeze(1)
         gradient_field = (
@@ -396,9 +552,6 @@ class BackEnd(mp.Process):
         ).clamp_min(1e-6)
         interface_normal = interface_normal.detach()
 
-        scaling = self.gaussians.get_scaling[regularizer_idx]
-        if scaling.shape[-1] == 1:
-            scaling = scaling.repeat(1, 3)
         rotation = self.gaussians.get_rotation[regularizer_idx]
         covariance_root = build_scaling_rotation(scaling, rotation)
         covariance = covariance_root @ covariance_root.transpose(1, 2)
@@ -415,25 +568,51 @@ class BackEnd(mp.Process):
         photo_grad_proxy_mean = (photo_step_mean / xyz_lr).detach()
         coh_grad_proxy_mean = (
             (
-                commitment_detached.squeeze(-1) * coherence_residual.norm(dim=1)
+                field_commitment_detached.squeeze(-1) * coherence_residual.norm(dim=1)
             ).mean()
             / xyz_lr
         ).detach()
+        anchor_disp_mean = (
+            (anchor_weight.squeeze(-1) * (xyz.detach() - anchor_xyz.detach()).norm(dim=1))
+            .mean()
+            .detach()
+        )
+        anchor_norm_disp_mean = (
+            (anchor_weight.squeeze(-1) * anchor_residual.detach().norm(dim=1)).mean()
+        ).detach()
+        field_std = (
+            field_commitment_detached.squeeze(-1).std(unbiased=False).detach()
+            if regularizer_count > 1
+            else zero
+        )
         debug_stats = {
             "photo_step_mean": photo_step_mean,
             "consensus_step_mean": consensus_delta.norm(dim=1).mean().detach(),
             "photo_grad_proxy_mean": photo_grad_proxy_mean,
             "coh_grad_proxy_mean": coh_grad_proxy_mean,
+            "anchor_norm_disp_mean": anchor_norm_disp_mean,
             "weighted_coh_ratio": (
                 self.lambda_coh
                 * coh_grad_proxy_mean
                 / photo_grad_proxy_mean.clamp_min(1e-12)
             ).detach(),
+            "weighted_anchor_ratio": (
+                self.lambda_anchor
+                * anchor_norm_disp_mean
+                / photo_step_mean.clamp_min(1e-12)
+            ).detach(),
+            "anchor_disp_mean": anchor_disp_mean,
             "interface_mean": interface_weight.mean().detach(),
+            "field_mean": field_commitment_detached.mean().detach(),
+            "field_std": field_std,
+            "field_max": field_commitment_detached.max().detach(),
+            "regularizer_idx": regularizer_idx.detach(),
+            "field_commitment": field_commitment_detached.squeeze(-1),
         }
 
         return (
             loss_coh,
+            loss_anchor,
             loss_thin,
             active_mask,
             commitment_proposals,
@@ -445,6 +624,7 @@ class BackEnd(mp.Process):
         self,
         photo_loss,
         loss_coh,
+        loss_anchor,
         loss_thin,
         active_mask,
         commitment_proposals,
@@ -499,8 +679,10 @@ class BackEnd(mp.Process):
             f"live_iters={live_iters}",
             f"photo={photo_loss.detach().item():.6f}",
             f"coh={loss_coh.detach().item():.3e}",
+            f"anchor={loss_anchor.detach().item():.3e}",
             f"thin={loss_thin.detach().item():.6f}",
             f"coh_w={(self.lambda_coh * loss_coh.detach()).item():.3e}",
+            f"anchor_w={(self.lambda_anchor * loss_anchor.detach()).item():.3e}",
             f"thin_w={(self.lambda_thin * loss_thin.detach()).item():.6f}",
             f"active={active_count}/{total_count}",
             f"regularizer={regularizer_count}",
@@ -514,16 +696,42 @@ class BackEnd(mp.Process):
             f"max={global_max:.4f}",
         )
         if debug_stats is not None:
-            Log(
+            scale_tokens = [
                 "Structural commitment scales",
                 f"iter={self.iteration_count}",
-                f"photo_step={debug_stats['photo_step_mean'].item():.3e}",
-                f"consensus_step={debug_stats['consensus_step_mean'].item():.3e}",
-                f"photo_grad={debug_stats['photo_grad_proxy_mean'].item():.3e}",
-                f"coh_grad_proxy={debug_stats['coh_grad_proxy_mean'].item():.3e}",
-                f"coh_ratio={debug_stats['weighted_coh_ratio'].item():.3e}",
-                f"interface={debug_stats['interface_mean'].item():.3e}",
-            )
+            ]
+            if "photo_step_mean" in debug_stats:
+                scale_tokens.extend(
+                    [
+                        f"photo_step={debug_stats['photo_step_mean'].item():.3e}",
+                        f"consensus_step={debug_stats['consensus_step_mean'].item():.3e}",
+                        f"photo_grad={debug_stats['photo_grad_proxy_mean'].item():.3e}",
+                        f"coh_grad_proxy={debug_stats['coh_grad_proxy_mean'].item():.3e}",
+                        f"coh_ratio={debug_stats['weighted_coh_ratio'].item():.3e}",
+                        f"anchor_norm_disp={debug_stats['anchor_norm_disp_mean'].item():.3e}",
+                        f"anchor_ratio={debug_stats['weighted_anchor_ratio'].item():.3e}",
+                        f"anchor_disp={debug_stats['anchor_disp_mean'].item():.3e}",
+                        f"interface={debug_stats['interface_mean'].item():.3e}",
+                    ]
+                )
+            if "field_mean" in debug_stats:
+                scale_tokens.extend(
+                    [
+                        f"field_mean={debug_stats['field_mean'].item():.4f}",
+                        f"field_std={debug_stats['field_std'].item():.4f}",
+                        f"field_max={debug_stats['field_max'].item():.4f}",
+                    ]
+                )
+            if "damping_mean" in debug_stats:
+                scale_tokens.extend(
+                    [
+                        f"damping_threshold={debug_stats['damping_threshold'].item():.4f}",
+                        f"damping_mean={debug_stats['damping_mean'].item():.3e}",
+                        f"damping_max={debug_stats['damping_max'].item():.3e}",
+                        f"damped={debug_stats['damped_points']}",
+                    ]
+                )
+            Log(*scale_tokens)
 
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
         self.gaussians.extend_from_pcd_seq(
@@ -704,6 +912,7 @@ class BackEnd(mp.Process):
             loss_mapping.backward()
 
             loss_coh = self.gaussians.get_xyz.new_tensor(0.0)
+            loss_anchor = self.gaussians.get_xyz.new_tensor(0.0)
             loss_thin = self.gaussians.get_xyz.new_tensor(0.0)
             active_mask = None
             commitment_proposals = None
@@ -723,6 +932,7 @@ class BackEnd(mp.Process):
                 )
                 (
                     loss_coh,
+                    loss_anchor,
                     loss_thin,
                     active_mask,
                     commitment_proposals,
@@ -732,10 +942,17 @@ class BackEnd(mp.Process):
                     photo_xyz_grad, visibility_filter_acm
                 )
                 structural_loss = structural_scale * (
-                    self.lambda_coh * loss_coh + self.lambda_thin * loss_thin
+                    self.lambda_coh * loss_coh
+                    + self.lambda_anchor * loss_anchor
+                    + self.lambda_thin * loss_thin
                 )
                 if structural_loss.requires_grad:
                     structural_loss.backward()
+                damping_stats = self._apply_structural_motion_damping(
+                    structural_scale, debug_stats
+                )
+                if debug_stats is not None and damping_stats is not None:
+                    debug_stats.update(damping_stats)
                 structural_ms = (time.perf_counter() - structural_start) * 1000.0
             gaussian_split = False
             ## Deinsifying / Pruning Gaussians
@@ -761,6 +978,7 @@ class BackEnd(mp.Process):
                     self._log_structural_commitment_status(
                         photo_loss,
                         loss_coh,
+                        loss_anchor,
                         loss_thin,
                         active_mask,
                         commitment_proposals,
@@ -769,6 +987,16 @@ class BackEnd(mp.Process):
                         structural_phase,
                         structural_scale,
                         live_iters,
+                    )
+                    active_commitment = (
+                        self.gaussians.get_structural_commitment[active_mask]
+                        .detach()
+                        .squeeze(-1)
+                    )
+                    self.gaussians.update_structural_anchor_state(
+                        active_mask,
+                        active_commitment,
+                        self.commitment_anchor_alpha * structural_scale,
                     )
 
                 # # compute the visibility of the gaussians
