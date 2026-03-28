@@ -45,7 +45,22 @@ Both were addressed in follow-up patches:
 - the structural losses now use the detached xyz gradient that already exists after the photometric backward pass, rather than keeping the render graph alive for a separate `autograd.grad` call,
 - the expensive structural regularizers now run on a capped active subset (`commitment_max_points`) while commitment proposals and EMA updates still cover the full active set,
 - local kNN field construction now halves its chunk size automatically on CUDA OOM instead of hard-failing immediately,
-- commitment-aware pruning bias and SLAM-window protection are now gated to the post-initialization phase (`lifecycle=live`) instead of affecting the `warmup` phase.
+- structural losses, commitment EMA updates, commitment-aware pruning bias, and SLAM-window protection are now all gated to the post-initialization phase (`lifecycle=live`) instead of affecting MonoGS `warmup`.
+
+Update: 2026-03-28 (coherence retune validated)
+
+The next validation pass focused on whether coherence was still too weak after the memory fixes.
+
+- an extra live diagnostic (`coh_ratio`) was added to compare the weighted coherence proxy against the photometric xyz gradient scale,
+- the shared structural default for `lambda_coh` was increased from `0.1` to `0.5`,
+- a clean TUM FR1 Desk structural smoke run then completed successfully with the retuned setting.
+
+Validated outcome:
+
+- the structural smoke run completed cleanly in about `104.08s` at about `5.69 FPS`,
+- live `coh_ratio` moved from the earlier `~0.09` regime into a much healthier `~0.4` to `~0.7` band,
+- the earlier "6x baseline GPU memory" impression was traced to overlapping stale structural runs on the same GPU rather than a single active structural process pair,
+- with only the current structural run active, total GPU memory sampled at about `1918 MiB`, which is still above the clean baseline sample but no longer pathological.
 
 ## Implemented Components
 
@@ -147,7 +162,7 @@ Implemented:
 Guardrail:
 
 - size-based safeguards remain active even for high-commitment Gaussians.
-- commitment-aware pruning/protection are now delayed until MonoGS reports `Initialized SLAM`, so the fragile initialization phase stays closer to baseline behavior.
+- structural commitment updates and commitment-aware pruning/protection are now delayed until MonoGS reports `Initialized SLAM`, so the fragile initialization phase stays closer to baseline behavior.
 
 ## Config Surface
 
@@ -168,7 +183,8 @@ Shared base and live configs now expose:
 Current default posture:
 
 - the feature is off by default,
-- the added values are conservative placeholders for opt-in experiments.
+- the added values are conservative placeholders for opt-in experiments,
+- the shared opt-in default for `lambda_coh` is now `0.5` after live diagnostics showed that `0.1` left coherence too weak to matter.
 
 Example opt-in config:
 
@@ -191,7 +207,10 @@ Runtime observations from the smoke tests:
 - a clean baseline sample measured about `494 MiB + 640 MiB` across the two main MonoGS Python processes,
 - a clean capped structural sample measured about `488 MiB + 540 MiB` early in the run and about `628 MiB + 782 MiB` later in the live phase,
 - the structural logs now report `regularizer=2048`, confirming that the expensive loss path is bounded,
-- the structural logs now report `lifecycle=warmup` before initialization and `lifecycle=live` after `Initialized SLAM`, confirming that commitment-aware lifecycle behavior is deferred until the map is initialized.
+- after raising `lambda_coh` from `0.1` to `0.5`, the retuned structural smoke run completed cleanly and reported about `104.08s` total time at about `5.69 FPS`,
+- the live diagnostics now report `coh_ratio` mostly in the `0.4` to `0.7` range, confirming that coherence is now material relative to the photometric xyz signal during live mapping,
+- the structural diagnostics only begin after `Initialized SLAM`, confirming that the structural path is bypassed during warmup rather than merely tagged as a separate lifecycle state,
+- the corrected clean-GPU reading for a single active structural smoke run was about `1918 MiB` total device memory at sample time, which is higher than baseline but far below the earlier contaminated multi-run readings.
 
 The runtime observability now exposes:
 
@@ -212,13 +231,14 @@ The runtime observability now exposes:
 
 1. The current kNN field is local and active-set-only, not a full-map continuous splat field.
 2. Coherence is realized as a target-position regularizer, not explicit optimizer-step blending.
-3. The coherence term is now observable in logs but remains numerically small compared with the thinness term and the photometric objective, so further convergence-focused tuning is still required.
-4. Commitment values still climb quickly, so the chosen EMA rate, protection threshold, and proposal definition may need refinement once memory is no longer the bottleneck.
-5. The existing isotropic scaling prior is still active alongside the thinness prior; their interaction should be evaluated experimentally.
+3. The coherence term is now material in live mapping (`coh_ratio` is typically around `0.4` to `0.7` in the smoke run), but that has only been validated on the short FR1 Desk smoke sequence.
+4. Commitment values still climb quickly and protected-Gaussian counts still reach the low-thousands in live mapping, so the EMA rate, protection threshold, and proposal definition may still need refinement on longer runs.
+5. The structural path now appears to cost roughly baseline-plus-some-headroom rather than baseline-times-six, but it is still measurably above baseline and should be profiled again on longer sequences.
+6. The existing isotropic scaling prior is still active alongside the thinness prior; their interaction should be evaluated experimentally.
 
 ## Recommended Next Experiment
 
 1. Use the capped structural smoke config as the new safe starting point.
-2. Compare convergence against the baseline now that GPU memory is no longer the limiting issue.
-3. Tune the coherence formulation and/or weight, because it is still much weaker than the thinness path in the current logs.
-4. Re-evaluate commitment protection thresholds now that lifecycle behavior is deferred to the post-initialization phase.
+2. Run the full FR1 Desk structural config and compare convergence against the baseline now that the short smoke run is stable.
+3. Re-evaluate commitment protection thresholds, because protected-Gaussian counts still grow quickly once live mapping starts.
+4. Profile structural memory again on a longer run to verify that the clean smoke-test memory picture holds outside the short validation sequence.

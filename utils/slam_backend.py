@@ -278,11 +278,20 @@ class BackEnd(mp.Process):
             interface_weight * extent_along_normal / trace.clamp_min(1e-6)
         ).mean()
 
+        photo_step_mean = photo_delta.norm(dim=1).mean().detach()
+        photo_grad_proxy_mean = (photo_step_mean / xyz_lr).detach()
+        coh_grad_proxy_mean = (
+            coherence_residual.norm(dim=1).mean() / xyz_lr
+        ).detach()
         debug_stats = {
-            "photo_step_mean": photo_delta.norm(dim=1).mean().detach(),
+            "photo_step_mean": photo_step_mean,
             "consensus_step_mean": consensus_delta.norm(dim=1).mean().detach(),
-            "coh_grad_proxy_mean": (
-                coherence_residual.norm(dim=1).mean() / xyz_lr
+            "photo_grad_proxy_mean": photo_grad_proxy_mean,
+            "coh_grad_proxy_mean": coh_grad_proxy_mean,
+            "weighted_coh_ratio": (
+                self.lambda_coh
+                * coh_grad_proxy_mean
+                / photo_grad_proxy_mean.clamp_min(1e-12)
             ).detach(),
             "interface_mean": interface_weight.mean().detach(),
         }
@@ -369,7 +378,9 @@ class BackEnd(mp.Process):
                 f"iter={self.iteration_count}",
                 f"photo_step={debug_stats['photo_step_mean'].item():.3e}",
                 f"consensus_step={debug_stats['consensus_step_mean'].item():.3e}",
+                f"photo_grad={debug_stats['photo_grad_proxy_mean'].item():.3e}",
                 f"coh_grad_proxy={debug_stats['coh_grad_proxy_mean'].item():.3e}",
+                f"coh_ratio={debug_stats['weighted_coh_ratio'].item():.3e}",
                 f"interface={debug_stats['interface_mean'].item():.3e}",
             )
 
@@ -546,7 +557,12 @@ class BackEnd(mp.Process):
             commitment_proposals = None
             regularizer_count = 0
             debug_stats = None
-            if self.use_structural_commitment and self.gaussians.get_xyz.shape[0] > 0:
+            structural_live = (
+                self.use_structural_commitment
+                and self.initialized
+                and self.gaussians.get_xyz.shape[0] > 0
+            )
+            if structural_live:
                 photo_xyz_grad = (
                     None
                     if self.gaussians._xyz.grad is None
@@ -576,6 +592,7 @@ class BackEnd(mp.Process):
 
                 if (
                     self.use_structural_commitment
+                    and self.initialized
                     and active_mask is not None
                     and commitment_proposals is not None
                     and commitment_proposals.numel() > 0
