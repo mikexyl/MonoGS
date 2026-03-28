@@ -43,6 +43,17 @@ Training:
   kf_overlap: 0.9
   kf_cutoff: 0.3
   prune_mode: 'slam'
+  use_structural_commitment: False
+  commitment_init_value: 0.0
+  commitment_alpha: 0.05
+  commitment_knn: 8
+  commitment_chunk_size: 256
+  commitment_max_points: 2048
+  commitment_log_every: 50
+  lambda_coh: 0.1
+  lambda_thin: 0.01
+  commitment_prune_bias: 0.05
+  commitment_protect_threshold: 0.7
 
   lr:
     cam_rot_delta: 0.003

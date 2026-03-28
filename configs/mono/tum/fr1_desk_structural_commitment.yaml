@@ -1,0 +1,5 @@
+inherit_from: "configs/mono/tum/fr1_desk.yaml"
+
+Training:
+  use_structural_commitment: True
+  commitment_log_every: 25

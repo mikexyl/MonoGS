@@ -1,0 +1,4 @@
+inherit_from: "configs/mono/tum/fr1_desk_structural_commitment_smoke.yaml"
+
+Results:
+  use_gui: True

@@ -1,0 +1,13 @@
+inherit_from: "configs/mono/tum/fr1_desk_structural_commitment.yaml"
+
+Results:
+  use_gui: False
+  save_results: False
+  eval_rendering: False
+  use_wandb: False
+
+Training:
+  init_itr_num: 100
+  tracking_itr_num: 20
+  mapping_itr_num: 20
+  commitment_log_every: 10

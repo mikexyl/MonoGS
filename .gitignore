@@ -12,5 +12,6 @@ cameras.json
 *.mp4
 datasets
 wandb
+.pixi
 
 result*

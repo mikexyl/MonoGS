@@ -12,14 +12,13 @@ from evo.tools import plot
 from evo.tools.plot import PlotMode
 from evo.tools.settings import SETTINGS
 from matplotlib import pyplot as plt
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-import wandb
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.image_utils import psnr
 from gaussian_splatting.utils.loss_utils import ssim
 from gaussian_splatting.utils.system_utils import mkdir_p
 from utils.logging_utils import Log
+from utils.wandb_utils import wandb
 
 
 def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
@@ -123,6 +122,8 @@ def eval_rendering(
     kf_indices,
     iteration="final",
 ):
+    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
     interval = 5
     img_pred, img_gt, saved_frame_idx = [], [], []
     end_idx = len(frames) - 1 if iteration == "final" or "before_opt" else iteration

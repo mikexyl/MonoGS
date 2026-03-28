@@ -44,6 +44,7 @@ class GaussianModel:
         self._opacity = torch.empty(0, device="cuda")
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
+        self.structural_commitment = torch.empty((0, 1), device="cuda")
 
         self.unique_kfIDs = torch.empty(0).int()
         self.n_obs = torch.empty(0).int()
@@ -64,6 +65,11 @@ class GaussianModel:
         self.ply_input = None
 
         self.isotropic = False
+        self.commitment_init_value = 0.0
+        if config is not None:
+            self.commitment_init_value = config.get("Training", {}).get(
+                "commitment_init_value", 0.0
+            )
 
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
@@ -94,6 +100,10 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def get_structural_commitment(self):
+        return self.structural_commitment
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(
@@ -218,6 +228,12 @@ class GaussianModel:
         new_scaling = nn.Parameter(scales.requires_grad_(True))
         new_rotation = nn.Parameter(rots.requires_grad_(True))
         new_opacity = nn.Parameter(opacities.requires_grad_(True))
+        new_commitment = torch.full(
+            (new_xyz.shape[0], 1),
+            self.commitment_init_value,
+            dtype=torch.float32,
+            device="cuda",
+        )
 
         new_unique_kfIDs = torch.ones((new_xyz.shape[0])).int() * kf_id
         new_n_obs = torch.zeros((new_xyz.shape[0])).int()
@@ -230,6 +246,7 @@ class GaussianModel:
             new_rotation,
             new_kf_ids=new_unique_kfIDs,
             new_n_obs=new_n_obs,
+            new_structural_commitment=new_commitment,
         )
 
     def extend_from_pcd_seq(
@@ -321,6 +338,7 @@ class GaussianModel:
             l.append("scale_{}".format(i))
         for i in range(self._rotation.shape[1]):
             l.append("rot_{}".format(i))
+        l.append("structural_commitment")
         return l
 
     def save_ply(self, path):
@@ -347,13 +365,24 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        structural_commitment = self.structural_commitment.detach().cpu().numpy()
 
         dtype_full = [
             (attribute, "f4") for attribute in self.construct_list_of_attributes()
         ]
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate(
-            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
+            (
+                xyz,
+                normals,
+                f_dc,
+                f_rest,
+                opacities,
+                scale,
+                rotation,
+                structural_commitment,
+            ),
+            axis=1,
         )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
@@ -433,6 +462,14 @@ class GaussianModel:
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        if "structural_commitment" in plydata.elements[0].data.dtype.names:
+            structural_commitment = np.asarray(
+                plydata.elements[0]["structural_commitment"]
+            )[..., np.newaxis]
+        else:
+            structural_commitment = np.full(
+                (xyz.shape[0], 1), self.commitment_init_value, dtype=np.float32
+            )
 
         self._xyz = nn.Parameter(
             torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
@@ -462,6 +499,9 @@ class GaussianModel:
         )
         self.active_sh_degree = self.max_sh_degree
         self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
+        self.structural_commitment = torch.tensor(
+            structural_commitment, dtype=torch.float, device="cuda"
+        )
         self.unique_kfIDs = torch.zeros((self._xyz.shape[0]))
         self.n_obs = torch.zeros((self._xyz.shape[0]), device="cpu").int()
 
@@ -517,6 +557,7 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self.structural_commitment = self.structural_commitment[valid_points_mask]
         self.unique_kfIDs = self.unique_kfIDs[valid_points_mask.cpu()]
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
 
@@ -564,6 +605,7 @@ class GaussianModel:
         new_rotation,
         new_kf_ids=None,
         new_n_obs=None,
+        new_structural_commitment=None,
     ):
         d = {
             "xyz": new_xyz,
@@ -585,6 +627,16 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if new_structural_commitment is None:
+            new_structural_commitment = torch.full(
+                (new_xyz.shape[0], 1),
+                self.commitment_init_value,
+                dtype=torch.float32,
+                device="cuda",
+            )
+        self.structural_commitment = torch.cat(
+            (self.structural_commitment, new_structural_commitment), dim=0
+        )
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
         if new_n_obs is not None:
@@ -616,6 +668,7 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+        new_commitment = self.structural_commitment[selected_pts_mask].repeat(N, 1)
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()].repeat(N)
         new_n_obs = self.n_obs[selected_pts_mask.cpu()].repeat(N)
@@ -629,6 +682,7 @@ class GaussianModel:
             new_rotation,
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
+            new_structural_commitment=new_commitment,
         )
 
         prune_filter = torch.cat(
@@ -657,6 +711,7 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_commitment = self.structural_commitment[selected_pts_mask]
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()]
         new_n_obs = self.n_obs[selected_pts_mask.cpu()]
@@ -669,16 +724,50 @@ class GaussianModel:
             new_rotation,
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
+            new_structural_commitment=new_commitment,
         )
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(
+        self,
+        max_grad,
+        min_opacity,
+        extent,
+        max_screen_size,
+        commitment_prune_bias=0.0,
+        commitment_protect_threshold=0.5,
+    ):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        opacity = self.get_opacity.squeeze()
+        prune_threshold = torch.full_like(opacity, min_opacity)
+        if commitment_prune_bias > 0.0 and self.structural_commitment.numel() > 0:
+            commitment = self.structural_commitment.squeeze()
+            pivot = torch.clamp(
+                torch.tensor(
+                    commitment_protect_threshold,
+                    dtype=commitment.dtype,
+                    device=commitment.device,
+                ),
+                1e-6,
+                1.0 - 1e-6,
+            )
+            lower_mask = commitment < pivot
+            upper_mask = ~lower_mask
+            if lower_mask.any():
+                prune_threshold[lower_mask] += commitment_prune_bias * (
+                    (pivot - commitment[lower_mask]) / pivot
+                )
+            if upper_mask.any():
+                prune_threshold[upper_mask] -= commitment_prune_bias * (
+                    (commitment[upper_mask] - pivot) / (1.0 - pivot)
+                )
+            prune_threshold = prune_threshold.clamp_min(0.0)
+
+        prune_mask = opacity < prune_threshold
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
@@ -693,3 +782,13 @@ class GaussianModel:
             viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
         )
         self.denom[update_filter] += 1
+
+    def update_structural_commitment(self, active_mask, proposals, alpha):
+        if self.structural_commitment.numel() == 0 or proposals.numel() == 0:
+            return
+
+        proposals = proposals.view(-1, 1).clamp_(0.0, 1.0)
+        self.structural_commitment[active_mask] = (
+            (1.0 - alpha) * self.structural_commitment[active_mask]
+            + alpha * proposals
+        ).clamp_(0.0, 1.0)

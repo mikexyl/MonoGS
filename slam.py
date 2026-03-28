@@ -9,7 +9,6 @@ import torch.multiprocessing as mp
 import yaml
 from munch import munchify
 
-import wandb
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.system_utils import mkdir_p
 from gui import gui_utils, slam_gui
@@ -20,6 +19,7 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import FakeQueue
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
+from utils.wandb_utils import wandb, wandb_available, wandb_import_error
 
 
 class SLAM:
@@ -225,6 +225,11 @@ if __name__ == "__main__":
         config["Results"]["eval_rendering"] = True
         Log("\tuse_wandb=True")
         config["Results"]["use_wandb"] = True
+
+    if config["Results"]["use_wandb"] and not wandb_available():
+        Log("wandb import failed; disabling wandb logging")
+        Log(f"\t{wandb_import_error()}")
+        config["Results"]["use_wandb"] = False
 
     if config["Results"]["save_results"]:
         mkdir_p(config["Results"]["save_dir"])
